@@ -19,7 +19,7 @@ contents属性的类型，之所以被定义为id类型，是因为在`Mac OS`�
 
 如果你试图在`iOS`平台上将`UIImage`的值赋给它，只能得到一个`空白`的图层。
 
-通过如下bridge转换方式，将UIImage实例设置给layer.contens属性:
+通过如下bridge转换方式，将UIImage实例设置给`layer.contens`属性:
 
 ```c
 layer.contents = (__bridge id)image.CGImage;
@@ -43,7 +43,7 @@ layer.contents = (__bridge id)image.CGImage;
 @end
 ```
 
-我们并没有使用`UIImageView`，而是一个普通的`CALayer`，就能够显示出一个图片。
+我们并没有使用`UIImageView`，而是一个普通的`CALayer`，就能够显示出一个`图片`。
 
 ### CALayer对象的contentGravity属性
 
@@ -328,7 +328,9 @@ contentsCenter的另一个很酷的特性就是，它可以在Interface Builder�
 所以，如果你不需要寄宿图，那就不要创建这个方法了，会造成CPU资源和内存的浪费。
 
 
-在`-drawRect:`方法实现中，可以利用Core Graphics去绘制一个寄宿图，然后内容就会被`缓存`起来直到它需要被更新（通常是因为开发者调用了-setNeedsDisplay方法，尽管影响到表现效果的属性值被更改时，一些视图类型会被自动重绘，如bounds属性）。
+在`-drawRect:`方法实现中，可以利用Core Graphics去绘制一个`寄宿图`，然后内容就会被`缓存`起来，直到它需要被更新。
+
+通常是因为开发者调用了`-setNeedsDisplay`方法，尽管影响到表现效果的属性值被更改时，一些视图类型会被自动重绘，如bounds属性。
 
 
 > 虽然 `-drawRect:`方法是一个UIView方法，事实上都是底层的CALayer安排了重绘工作和保存此时产生的图像。
@@ -339,12 +341,12 @@ CALayer有一个可选的delegate属性，实现了CALayerDelegate协议。
 - (1) delegate1、当需要被重绘时，CALayer会请求它的代理给它一个寄宿图来显示
 
 ```objc
-(void)displayLayer:(CALayer *)layer;
+- (void)displayLayer:(CALayer *)layer;
 ```
 
-这个时候，代理可以自己创建一个寄宿图，然后通过`contents`属性进行设置给CALayer对象，不然没有别的方法可以调用了。
+这个时候，代理可以自己创建一个`寄宿图`，然后通过`contents`属性进行设置给CALayer对象，不然没有别的方法可以调用了。
 
-- (1) delegate2、如果代理不实现-displayLayer:方法，CALayer就会转而尝试调用下面这个方法：
+- (2) delegate2、如果代理不实现`-displayLayer:`方法，CALayer就会转而尝试调用下面这个方法：
 
 ```objc
 - (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx;
@@ -395,4 +397,4 @@ CALayer有一个可选的delegate属性，实现了CALayerDelegate协议。
 
 - (2) 尽管我们没有用`masksToBounds`属性，绘制的那个圆仍然沿边界被`裁剪`了。这是因为当使用`CALayerDelegate`绘制`寄宿图`的时候，并`没有`对`超出边界外的内容`提供绘制支持。
 
-只有创建了一个单独的图层，你几乎没有机会用到CALayerDelegate协议。因为当UIView创建了它的backing layer时，它就会自动地把CALayer的delegate设置为它自己，并提供了一个`-displayLayer:`的实现，那所有的问题就都没了。
+只有创建了一个单独的图层，你几乎没有机会用到CALayerDelegate协议。因为当UIView创建了它的`backing layer`时，它就会自动地把CALayer的delegate设置为它自己，并提供了一个`-displayLayer:`的实现，那所有的问题就都没了。

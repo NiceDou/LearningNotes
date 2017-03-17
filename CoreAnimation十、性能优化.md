@@ -261,7 +261,7 @@ PNG或者JPEG压缩之后的图片文件会比同质量的位图小得多。
 
 ## 优化八、`-[CALayer renderInContext:]` 方法使用
 
-使用CALayer的-renderInContext:方法，你可以将图层及其子图层快照进一个Core Graphics上下文然后得到一个图片，它可以直接显示在UIImageView中，或者作为另一个图层的contents。
+使用CALayer的`-renderInContext:`方法，可以将图层及其子图层`快照`进一个`Core Graphics`上下文然后得到一个`图片`，它可以`直接显示在UIImageView`中，或者作为另一个`图层的contents`。
 
 eg、把整个屏幕转化为图片
 

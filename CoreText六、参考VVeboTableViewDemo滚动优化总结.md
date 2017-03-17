@@ -10,6 +10,17 @@
 
 下面开始总结下，一些主要的优化点。
 
+
+优化一、异步子线程frame计算并缓存
+
+优化二、使用CoreText完成图文混排并绘制到一个BitmapImageContext中，再从BitmapImageContext获取渲染完毕的Image，然后将Image塞给UI或Layer显示，整个过程都在`子线程`异步完成
+
+优化三、对CoreText对一段文本渲染时产生的`CTFrameRef`实例进行内存缓存，避免再对同一段文本继续解析
+
+优化四、tableview快速滚动时，如果中间滚动超过一定数的cell时，忽略掉中间快速滚过的cell的数据绘制
+
+优化五、自定义一个`串行 dispatch_queue_t`实例的缓存池。按照QOS的分类，进行对应的缓存。其缓存的`dispatch_queue_t`个数等于当前CPU激活的核心数
+
 ## 优化一、异步子线程frame计算并缓存
 
 ```objc

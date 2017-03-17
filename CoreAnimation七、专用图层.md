@@ -4,26 +4,13 @@
 
 但都只是看到了最简单的CALayer类，其实还有很多不同的CALayer子类，各自都可以提供不同的功能，针对每一种场景充分利用，来提高UI的性能。
 
-## 列举下所有的专用图层
-
-- (1) CAShapeLayer
-- (2) CATextLayer
-- (3) CATransformLayer
-- (4) CAGradientLayer
-- (5) CAReplicatorLayer
-- (6) CAScrollLayer
-- (7) CATiledLayer
-- (8) CAEmitterLayer
-- (9) CAEAGLLayer
-- (10) AVPlayerLayer
-
-## CAShapeLayer、是一个通过`矢量图形`而不是`bitmap`来绘制的图层子类
+## 使用CALayer绘制
 
 ### 在layer中进行绘制路径有两种方法:
 
 - (1) 重写`drawRect: 或 drawInContext:`，用CoreGraphics绘制代码，直接向`原始的CALyer`的寄宿图中绘制一个路径
 
-- (2) 使用CAShapeLayer这个专用图层，然后使用`CGPath`定义要绘制的路径
+- (2) 使用CAShapeLayer/CATextLayer等`专用图层`，然后使用`CGPath`定义要绘制的路径
 
 相比上面两种方法，`(2)`方法性能会更好。
 
@@ -55,13 +42,15 @@ GPU >>> 大量进行图像渲染，少进行数据计算
 
 - (1) 渲染快速。
 
-CAShapeLayer使用了`硬件加速（直接由GPU绘制）`，绘制同一图形会比用`CoreGraphics（由CPU绘制，进行CPU离屏渲染）`快很多。
+各种专用图层使用了`硬件加速（直接由GPU绘制）`，绘制同一图形会比用`CoreGraphics（由CPU绘制，进行CPU离屏渲染）`快很多。
 
 CPU离屏渲染，会导致CPU做大量的`图像渲染`任务，而CPU本身并不是用来`图像渲染`的，而是用来`数据计算`的。
 
 所以，将大量的图像渲染代码交给`专用图层`来完成，而`专用图层`使用OpenGL操作`GPU`来完成图像的渲染。
 
 `GPU`的`图像渲染`能力，远远大于CPU，但是CPU的`数据计算`能力，又远远大于GPU。
+
+### 使用专用图层绘制时的优点:
 
 - (2) 高效使用内存。
 
@@ -74,6 +63,22 @@ CPU离屏渲染，会导致CPU做大量的`图像渲染`任务，而CPU本身并
 - (4) 不会出现像素化。
 
 当你给CAShapeLayer做3D变换时，它不像一个有寄宿图的普通图层一样变得像素化。
+
+
+## 列举下所有的专用图层
+
+- (1) CAShapeLayer 矢量绘图
+- (2) CATextLayer 文本绘制
+- (3) CATransformLayer 形变绘制
+- (4) CAGradientLayer 渐变绘制
+- (5) CAReplicatorLayer 重复多个样式的绘制
+- (6) CAScrollLayer 类似ScollView
+- (7) CATiledLayer 切割大图为n个小图，按需加载
+- (8) CAEmitterLayer 不常用
+- (9) CAEAGLLayer 不常用
+- (10) AVPlayerLayer 播放视频，不算为一种高效layer
+
+## CAShapeLayer、是一个通过`矢量图形`而不是`bitmap`来绘制的图层子类
 
 ### 用CAShapeLayer + UIBezirePath（对CGPathRef的高度封装）绘制一个火柴人
 
@@ -148,6 +153,16 @@ UIRectCorner corners = UIRectCornerTopRight | UIRectCornerBottomRight | UIRectCo
 
 //4. create path
 UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:rect byRoundingCorners:corners cornerRadii:radii];
+
+//5.
+CAShapeLayer *maskLayer = [[CAShapeLayer alloc]init];
+maskLayer.frame = self.bounds;
+
+//6. 
+maskLayer.path = maskPath.CGPath;
+
+//7.    
+[self.layer addSublayer:maskLayer];
 ```
 
 如上只是在父亲layer中，`添加`绘制出一个路径，但是可以被其他的sublayer绘制的路径所擦除。
@@ -1018,7 +1033,7 @@ NSInteger y = floor(bounds.origin.y / layer.tileSize.height * scale);
 @end
 ```
 
-> 在一个真正的OpenGL应用中，我们可能会用`NSTimer`或`CADisplayLink`周期性地`每秒`钟调用`-drawRrame`方法`60`次（`FPS=60`），同时会将几何图形生成和绘制分开以便不会每次都重新生成三角形的顶点。
+> 在一个真正的OpenGL应用中，我们可能会用`NSTimer`或`CADisplayLink`周期性地`每秒`钟调用`-drawRect:`方法`60`次（`FPS=60`），同时会将几何图形生成和绘制分开以便不会每次都重新生成三角形的顶点。
 
 
 <img src="./专用图层11.png" alt="" title="" width="700"/>

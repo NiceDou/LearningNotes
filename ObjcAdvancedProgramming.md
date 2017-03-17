@@ -3,50 +3,215 @@
 
 因为App启动时，会等待所有objc类的load方法实现全部执行完，才会走后面的代码逻辑。
 
+## 主线程上常见比较耗时的代码类型:
+
+- (1) 各种NSObject对象的创建与废弃
+
+- (2) UIKit Obejcts UI对象
+	- UI对象的属性值调整
+	- UI对象的创建
+	- UI对象的销毁（废弃）
+
+- (3) Layout 布局计算
+	- 计算文本内容的 宽度计算、高度计算
+	- frmae计算、frmae设置、frmae调整
+
+- (4) Rendering 显示数据渲染
+	- 文本内容的渲染
+	- 图片的解码
+	- 图形的绘制
+
+尽量的将如上步骤，全部放到子线程异步执行。
+
+## 异步子线程进行图像解压缩、渲染、圆角处理
+
+简单的demo:
+
+```objc
+@implementation UIImageHelper
+
+- (void)decompressImageNamed1:(NSString *)name ofType:(NSString *)type completion:(void (^)(UIImage *image))block {
+    
+//    XZHDispatchQueueAsyncBlockWithQOSBackgroud(^{
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        
+        //1.
+        NSString *filepath = [[NSBundle mainBundle] pathForResource:name ofType:type];
+        UIImage *image = [UIImage imageWithContentsOfFile:filepath];
+        
+        //2.
+        UIGraphicsBeginImageContextWithOptions(image.size, NO, [UIScreen mainScreen].scale);
+        CGContextRef context = UIGraphicsGetCurrentContext();
+        
+        //3.
+        CGRect rect = CGRectMake(0, 0, image.size.width, image.size.height);
+        
+        //4. 圆角路径切割画布成为圆角的区域画布
+        CGFloat cornerWidth = image.size.width * 0.3;
+        CGFloat cornerHeight = image.size.height * 0.3;
+        CGMutablePathRef path = CGPathCreateMutable();
+        CGPathAddRoundedRect(path, NULL, rect, cornerWidth, cornerHeight);
+        CGContextAddPath(context, path);
+        CGContextClip(context);
+        
+        //5. 再将图像绘制到圆形区域画布中
+        [image drawInRect:rect];
+        
+        //6.
+        UIImage *decompressImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        
+        //7.
+        dispatch_async(dispatch_get_main_queue(), ^() {
+            block(decompressImage);
+        });
+    });
+}
+
+@end
+```
+
+参考自AFImageDownloader的demo:
+
+```objc
+@implementation UIImageHelper
+
+- (void)decompressImageNamed2:(NSString *)name ofType:(NSString *)type completion:(void (^)(UIImage *image))block {
+    XZHDispatchQueueAsyncBlockWithQOSBackgroud(^{
+    
+        //1. 使用ImageIO读取文件，会缓存图像
+        NSDictionary *dict = @{
+                               // 指定缓存解压后的图像
+                               (id)kCGImageSourceShouldCache : @(YES)
+                               };
+        NSString *filepath = [[NSBundle mainBundle] pathForResource:name ofType:type];
+        NSURL *url = [NSURL fileURLWithPath:filepath];
+        CGImageSourceRef source = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
+        CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, (CFDictionaryRef)dict);
+        
+        //2. Create a bitmap context of a suitable size to draw to, forcing decode
+        size_t width = CGImageGetWidth(cgImage);//图片的真实宽度
+        size_t height = CGImageGetHeight(cgImage);//图片的真实高度
+        size_t bytesPerRow = roundUp(width * 4, 16);
+        size_t byteCount = roundUp(height * bytesPerRow, 16);
+        if (width == 0 || height == 0) {
+            CGImageRelease(cgImage);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                block(nil);
+            });
+            return;
+        }
+        
+        //3. Create the colour space and an image buffer
+        void *imageBuffer = malloc(byteCount);
+        CGColorSpaceRef colourSpace = CGColorSpaceCreateDeviceRGB();
+        
+        //4. Create the image context and release the colour space.
+        CGContextRef imageContext = CGBitmapContextCreate(imageBuffer, width, height, 8, bytesPerRow, colourSpace, kCGImageAlphaPremultipliedLast);
+        CGColorSpaceRelease(colourSpace);
+        
+        //5. Draw the image to the context and release it.
+        CGContextDrawImage(imageContext, CGRectMake(0, 0, width, height), cgImage);
+        CGImageRelease(cgImage);
+        
+        //6. Now get an image ref from the context.
+        CGImageRef outputImage = CGBitmapContextCreateImage(imageContext);
+        
+        //7. Clean up memory allocated by the colour space and image buffer.
+        CGContextRelease(imageContext);
+        free(imageBuffer);
+        
+        //8. callback outputImage converted UIImage
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIImage *image = [UIImage imageWithCGImage:outputImage];
+            block(image);
+            
+            // Release the output image after the callback has been completed.
+            CGImageRelease(outputImage);
+        });
+    });
+}
+
+@end
+```
+
+### 总结在子线程提前对一些PNG、JPEG等压缩格式的图文文件进行渲染时几个步骤:
+
+- (1) 先让流程在一个后台子线程上完成
+- (2) 使用ImageIO读取压缩格式图片文件，进行解压缩，并缓存起来
+- (3) 开起一个绘图上下文
+- (4) 圆角`CGPathRef`创建，clip剪裁，添加到绘图上下文
+- (5) 将解压缩后的图像，在绘图上下文中进行绘制
+- (6) 从绘图上下文中，获得最终渲染完毕的`CGImageRef`实例
+- (7) 再回到主线程
+- (8) 将`CGImageRef`实例，设置给`UIView.layer.contents`属性值进行显示
+
+还可以更近异步，将处理后最终的图像，在内存中缓存起来。
+
 ## YYMemoryCache中在子线程释放废弃对象的`三部曲`
 
 ```objc
 - (void)removeAll {
+    
+    //1. 基本变量值清零
     _totalCost = 0;
     _totalCount = 0;
+    
+    //2. objc单个对象释放与废弃
     _head = nil;
     _tail = nil;
     
+    //3. objc Array/Set/Dic 容器类型对象的释放与废弃，固定的三步曲
     if (CFDictionaryGetCount(_nodeMap) > 0) {
         
-        //第一步、增加一个局部指向，dic.retainCount = 2
+        //3.1 增加一个【局部】指向，dic.retainCount = 2
         CFMutableDictionaryRef holder = _nodeMap;
         
-        //第二步、让之前的指针指向新创建的对象，dic.retainCount = 1
+        //3.2 让之前的指针指向新创建的对象，dic.retainCount = 1，即完释放之前的一个持有关系
         _nodeMap = CFDictionaryCreateMutable(CFAllocatorGetDefault(), 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         
-        /**
-         *  所有的node缓存节点内存释放与废弃，包含两种逻辑:
-         *  - (1) 异步释放与废弃
-         *      - 主线程完成
-         *      - 子线程完成
-         *  - (2) 同步释放与废弃
-         *      - 当前创建node对象的所在线程（node对象的创建基本上都处于主线程）
-         */
-        
-        //第三步、让此时retainCount==1的dic对象的释放废弃流程异步走到子线程中完成
+        //3.3 让此时retainCount==1的dic对象的释放废弃流程异步走到子线程中完成
         if (_releaseAsynchronously) {
+            
+            //3.3.1 【主线程】或【子线程】，【异步】完成对象的废弃
             if (_releaseOnMainThread && !pthread_main_np()) {
+                // 【1.主线程】
                 dispatch_async(dispatch_get_main_queue(), ^{
                     CFRelease(holder);//最终在主线程， dic.retainCount = 0
                 });
             } else {
+                // 【2.子线程】
                 dispatch_queue_t queue = _releaseOnMainThread ? dispatch_get_main_queue() : XZHMemoryCacheGetReleaseQueue();
                 dispatch_async(queue, ^{
                     CFRelease(holder);//最终在子线程，dic.retainCount = 0
                 });
             }
         } else {
+            //3.3.2 【当前线程】，【同步】完成对象的废弃
             CFRelease(holder);//最终在执行removeAll所在线程，dic.retainCount = 0
         }
     }
 }
 ```
+
+简写为如下:
+
+```objc
+//1. 增加一个【局部】指向，dic.retainCount = 2
+CFMutableDictionaryRef holder = _nodeMap;
+
+//2. 让之前的指针指向新创建的对象，dic.retainCount = 1，即完释放之前的一个持有关系
+_nodeMap = CFDictionaryCreateMutable(CFAllocatorGetDefault(), 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+//3. 子线程完成局部指针的释放，并让被执行的对象最终在子线程完成废弃
+dispatch_async(dispatch_get_global_queue(0,0), ^{
+	CFRelease(holder);//最终在子线程，dic.retainCount = 0
+});
+```
+
+大致的思路就是让一个`子线程`，去持有一个`retainCount==1`的`局部`对象，最终在`子线程`上完成对`局部`对象的release，从而让局部指针指向的对象`废弃`掉。
+
+> 对象的释放 与 对象的废弃，是两个不同的概念，在不同的时间进行处理。
 
 通常是在子线程创建大体积对象，然后回调主线程使用。或者将主线程上不再使用的对象，异步放到子线程完成释放废弃。
 
@@ -64,14 +229,15 @@
 
 但是`(2)`不太合常理，会影响主线程的执行效率，所以不推荐。
 
-
 ## KVO的大致实现总结
 
-- (1) 当一个对象的属性添加了属性观察者之后，这个`对象的 isa指针`会被修改
+- (1) 当一个对象的属性添加了属性观察者之后
 
-- (2) 由runtime在运行时创建出一个对象所属类的一个子类，名字的格式是`NSKVONotifying_原始类名`
+- (2) 在程序运行时，系统通过`runtime`提供的函数，创建出一个对象所属类的一个`子类`，名字的格式是`NSKVONotifying_原始类名`
 
-- (3) 重写原来父类中被观察属性property的setter方法实现
+- (3) 此时将被添加属性观察的objc类的`对象->isa`指针，指向上面`(2)`创建出来的objc类，就不再指向之前的objc类了
+
+- (4) 运行时创建的`NSKVONotifying_原始类名`这个类，会重写原来父类中被观察属性property的`setter方法实现`。比如如下:
 
 ```objc
 - (void)setType:(NSSting *)type {
@@ -84,26 +250,24 @@
 }
 ```
 
-- (4) 对象的 isa指针，由runtime系统替换指向为第二步中创建的中间类`NSKVONotifying_原始类名`
+- (5) 当对象的被观察属性值发生改变时（中间类的setter方法实现被调用），就会回调执行观察者的`observeValueForKeyPath: ofObject:change:context:`方法实现，并且是`同步`调用的
 
-- (5) 当对象的被观察属性值发生改变时（中间类的setter方法实现被调用），就会回调执行观察者的`observeValueForKeyPath: ofObject:change:context:`方法实现。并且是同步调用的。
+- (6) 如下两个方法的返回的`objc_class`结构体实例是`不同`的
 
-- (6) 如下两个方法的返回的objc_class结构体实例是`不同`的
-
-```
-object_getClass(被观察者对象) >>> 返回的是替换后的`中间类`
+```c
+object_getClass(被观察者对象) >>> 返回的是替换后的`中间类` >>> 因为读取的是isa指向的Class
 ```
 
-```
-[被观察对象 class] >>> 仍然然会之前的`原始类`
+```c
+[被观察对象 class] >>> 仍然然会之前的`原始类`，这个Class应该是备用的
 ```
 
-- (7) 当对象移除属性观察者之后，该`对象的isa指针`又会`恢复`指向为`原始类`
+- (7) 当对象移除属性观察者之后，该`对象的 isa指针`又会`恢复`指向为`原始类`
 
 
 ##  `objc_msgSend()` 函数类型转换的格式
 
-```
+```c
 ((void (*)(id, SEL)) (void *) objc_msgSend)(obj, sel1);
 ```
 
@@ -177,6 +341,72 @@ void test() {
 }
 ```
 
+## `IMP Caching`: 使用 `methodForSelector:` 获取objc方法 IMP，然后缓存起来。以后每次调用该oc函数时，直接使用IMP
+
+首先，有一个测试类:
+
+```objc
+@interface Person : NSObject
++ (void)logName1:(NSString *)name;
+- (void)logName2:(NSString *)name;
+@end
+@implementation Person
++ (void)logName1:(NSString *)name {
+    NSLog(@"log1 name = %@", name);
+}
+- (void)logName2:(NSString *)name {
+    NSLog(@"log2 name = %@", name);
+}
+@end
+```
+
+然后ViewController测试IMP Caching:
+
+```c
+#import <objc/runtime.h>
+
+static id PersonClass = nil;
+static SEL PersonSEL1;
+static SEL PersonSEL2;
+static IMP PersonIMP1;
+static IMP PersonIMP2;
+
+@implementation ViewController
+
++ (void)initialize {
+    PersonClass = [Person class];
+   
+    PersonSEL1 = @selector(logName1:);
+    PersonSEL2 = @selector(logName2:);
+    
+    //获取类方法实现
+    PersonIMP1 = [PersonClass methodForSelector:PersonSEL1];
+    
+    //获取对象方法实现
+    PersonIMP2 = method_getImplementation(class_getInstanceMethod(PersonClass, PersonSEL2));
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+
+    //1. 调用类方法实现，需要使用最终编译生产对应的c函数的格式，进行函数类型的强制转换
+    ((void (*)(id, SEL, NSString*)) (void *) PersonIMP1)(PersonClass, PersonSEL1, @"我是参数");
+    
+    //2. 调用对象方法实现
+    ((void (*)(id, SEL, NSString*)) (void *) PersonIMP2)([Person new], PersonSEL2, @"我是参数");
+    
+    NSLog(@"");
+}
+
+@end
+```
+
+输出结果
+
+```
+2017-02-08 22:47:46.586 Test[805:25490] log1 name = 我是参数
+2017-02-08 22:47:46.587 Test[805:25490] log2 name = 我是参数
+```
+
 ## sendAction 发送UIEvent事件
 
 - UIApplication
@@ -195,11 +425,11 @@ sendAction:to:forEvent:
 
 ## 当遇到`多种选择条件`时，要尽量使用`查表`法实现
 
-比如 switch/case，C Array，如果查表条件是对象，则可以用 NSDictionary 来实现。
+比如 `switch/case`，C Array，如果查表条件是对象，则可以用 NSDictionary 来实现。
 
 比如，如下很多的`if-elseif`的判断语句:
 
-```objc
+```c
 NSString *name = @"XIONG";
     
 if ([name isEqualToString:@"XIAOMING"]) {
@@ -213,25 +443,36 @@ if ([name isEqualToString:@"XIAOMING"]) {
 }
 ```
 
-使用`NSDictionary+Block`来封装`条件 : 执行路径`:
+使用`NSDictionary+Block`来封装`条件对应的key`与`执行代码block`的键值对关系:
 
-```objc
+```c
 NSDictionary *map = @{
-                      @"XIONG1" : ^() {NSLog(@"task 1");},
-                      @"XIONG2" : ^() {NSLog(@"task 2");},
-                      @"XIONG3" : ^() {NSLog(@"task 3");},
-                      @"XIONG4" : ^() {NSLog(@"task 4");},
-                      };
+	// if条件的key : if条件要执行的代码封装的block
+	@"XIONG1" : ^() {NSLog(@"task 1");},
+  	@"XIONG2" : ^() {NSLog(@"task 2");},
+  	@"XIONG3" : ^() {NSLog(@"task 3");},
+  	@"XIONG4" : ^() {NSLog(@"task 4");},
+};
+```
 
-void (^block)(void) = [map objectForKey:name];
+然后使用某一个条件的`key`值，查询`dic`获取得到要`执行的代码`
+
+```c
+//1. 查找if条件key对应的block语句
+void (^block)(void) = [map objectForKey:@"XIONG"];
+
+//2. 执行if条件对应的block任务代码
 block();
 ```
 
 查表属于hash算法，在`非常多的if-elseif`判断语句时，效率会提升很多的。
 
-但是，如果`key值`都很相似，这个时候就会造成每一次都是从hash表从头到尾遍历冲突，找到下一个，这样效率也很差的，比如:
+> 如果`key值`都很相似，这个时候就会造成每一次都是从hash表从头到尾遍历冲突，找到下一个，这样效率也很差的。
 
-```objc
+
+比如:
+
+```c
 NSDictionary *map = @{
                       @"nil" : @1,
                       @"nIl" : @1,
@@ -244,11 +485,26 @@ NSDictionary *map = @{
 
 所有的key值都太相似了，那么这种情况下，给一个key值查表时，几乎都是循环挨个遍历。
 
+所以，在给各种`if条件`构造`唯一key`时，尽量要`差别很大`。
+
 ## objc对象、objc类、meta类、super 之间`isa`指针与`super_class`指针的指向关系
 
 <img src="./runtime1.jpeg" alt="" title="" width="700"/>
 
 <img src="./runtime2.png" alt="" title="" width="700"/>
+
+### isa指针的指向
+
+- (1) `object->isa` 指向 `objc类`
+- (2) `objc类->isa` 指向 `Meta objc类`
+- (3) `Meta objc类->isa` 指向 `Meta NSObject类`
+
+### `super_class`指针的指向
+
+- (1) `objc类->super_class` 执行 `父亲 objc类`
+- (2) `NSObject类->super_class` 指向 `nil`
+- (3) `Meta objc类->super_class` 指向 `Meta NSObject类`
+- (4) `Meta NSObject类->super_class` 指向 `Meta NSObject类（自己）`
 
 ## 我们编写的NSObject类，在程序运行时加载的过程
 
@@ -274,15 +530,113 @@ BOOL class_addMethod(Class cls,
 //4. 添加实现的协议
 BOOL class_addProtocol(Class cls, Protocol *protocol);
 
-//5. 将处理完毕的Class注册到运行时系统，之后就无法再对其修改Ivar
+//5. 【重要】将处理完毕的Class注册到运行时系统，之后就无法修改【Ivar】
 void objc_registerClassPair(Class cls);
 ```
 
-当执行完最后一步`objc_registerClassPair(Class cls)`，就会进行Ivar的内存布局计算了，之后就无法再改变了。
+Ivar在所属`Class`的内存块中，按照偏移量的形式依次排列:
 
-所以这就是为什么之前给Cat类添加Ivar不成功的原因。
+<img src="./Ivar_offset.png" alt="" title="" width="700"/>
 
-## `直接操作Ivar > getter/setter > KVC`
+### 涉及到一个内存字节对其的问题，其规律就是:
+
+- (1) 每一个Ivar相对于整个存储空间起始地址的`总偏移量`，必须是自身长度的整数倍
+- (2) 最终整个存储空间的长度，必须是最大长度Iavr的整数倍
+- (3) 满足如上(1)、(2)时，使用空白的字节进行填充，不会做任何使用，只是做对其而已
+
+具体布局规则可查看
+
+```
+objc对象的成员变量的内存布局.md
+```
+
+
+> 当执行完最后一步`objc_registerClassPair(Class cls)`，就会进行`Ivar的内存布局`计算了，之后就`无法再改变`了。
+
+
+下面是一个例子，运行时创建一个类，并添加Ivar、Property、Method，并完成调用:
+
+```c
+void PersonLog(id target, SEL sel, NSString *name) {
+    NSLog(@"IMP PersonLog: name = %@", name);
+}
+
+@implementation ViewController
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    
+    // 创建一个类，继承自NSObject类的子类
+    Class class = Nil;
+    class = objc_allocateClassPair([NSObject class], "Person", 0);
+    
+    // 创建一个属性 >>> @property(nonatomic, copy) NSString *name;
+    objc_property_attribute_t type = {"T", "@\"NSString\""};
+    objc_property_attribute_t nonatomic = { "N", "" };
+    objc_property_attribute_t copy = { "C", "" };
+    objc_property_attribute_t ivarName = { "V", "_name"};
+    objc_property_attribute_t attrs[] = {type, nonatomic, copy, ivarName};
+    bool success = class_addProperty(class, "name", attrs, 4);
+    if (success) {
+        NSLog(@"add Property success");
+    }
+    
+    // 给类添加一个Ivar
+    if (class_addIvar(class, "_name", sizeof(NSString*), log2(sizeof(NSString*)), "@")) {
+        NSLog(@"add Ivar success");
+    }
+    
+    // 给Class添加一个Method
+    if (class_addMethod(class, @selector(logName), (IMP)&PersonLog, "v@:@")) {
+        NSLog(@"add Method success");
+    };
+    
+    // 向运行时系统注册这个类
+    // 注意: 添加Ivar、Property、Method..都必须在objc_registerClassPair()之前完成
+    if (!objc_lookUpClass("Person")) {
+        objc_registerClassPair(class);
+    }
+    
+    
+    // 创建类实例
+    id p1 = class_createInstance(class, 0);
+    
+    // 获取类对象的一个Ivar
+    Ivar ivar = class_getInstanceVariable(class, "_name");
+    
+    // 获取Proeprty的type encodings
+    objc_property_t proeprty = class_getProperty(class, "name");
+    const char *types = property_getAttributes(proeprty);
+    NSLog(@"types = %@", [NSString stringWithUTF8String:types]);
+    
+    // 对Ivar进行设值
+    object_setIvar(p1, ivar, @"XiongZenghui");
+    
+    // 获取Ivar的值
+    NSString *name = object_getIvar(p1, ivar);
+    NSLog(@"name = %@", name);
+    
+    //10. 执行Method
+    ((void (*)(id,SEL,NSString*)) (void*) objc_msgSend)(p1, @selector(logName), @"hahahahaha");
+    
+    //11. 废弃掉创建的Class
+    objc_destructInstance(class);
+}
+
+@end
+```
+
+输出
+
+```
+2017-03-06 18:52:58.337 Demo[21770:326695] add Property success
+2017-03-06 18:52:58.338 Demo[21770:326695] add Ivar success
+2017-03-06 18:52:58.338 Demo[21770:326695] add Method success
+2017-03-06 18:52:58.338 Demo[21770:326695] types = T@"NSString",N,C,V_name
+2017-03-06 18:52:58.338 Demo[21770:326695] name = XiongZenghui
+2017-03-06 18:52:58.338 Demo[21770:326695] IMP PersonLog: name = hahahahaha
+```
+
+## `读写 Ivar > 发送 getter/setter 消息 > KVC`
 
 Key-Value Coding 使用起来非常方便，但性能上要差于直接调用 Getter/Setter，所以如果能避免 KVC 而用 Getter/Setter 代替，性能会有较大提升。
 
@@ -306,18 +660,61 @@ KVC首先根据`setValue:forKey:`传入的key，查找到对应的`Ivar`，这�
 ```objc
 - (void)test {
     
-    // Ivar的名字默认都是以为下划线开始的，eg： _name、_age ...
+    //1. 获取Ivar。注意：名字默认都是以为下划线开始的。
+    // eg： _name、_age ...
     Ivar ivar = class_getInstanceVariable([Dog class], "_name");
     
+    //2. 
     Dog *dog = [Dog new];
+    
+    //3. 直接对Ivar进行写
     object_setIvar(dog, ivar, @"我是你妈");
     
-    NSLog(@"name = %@", dog.name);
+    //4. 直接对Ivar进行读
+    NSLog(@"name = %@", object_getIvar(dog, ivar));
 
 }
 ```
 
 除了第一步查找Ivar之外，后面都是直接绕过了objc的消息传递过程，直接对Ivar进行存取。
+
+但是我在封装一些runtime的工具代码的时候，发现`object_getIvar()、object_setIvar()`会在一些基本数据类型（BOOL、float、int、long ...）时会崩溃，提示`BAD_ACESS`。
+
+解决:
+
+```
+http://stackoverflow.com/questions/8356232/object-getivar-fails-to-read-the-value-of-bool-ivar
+```
+
+崩溃的原因是由于，`object_getIvar()、object_setIvar()`只适用于`ARC`环境，默认会将Ivar的返回值类型当做是objc对象，就会对返回值对象进行retain/release，而基本类型变量（BOOL、float、int、long ...）是不能retain/release。
+
+但是也可以让`object_getIvar()、object_setIvar()`支持对基本类型的Ivar村取值，使用类似强转`objc_msgSend()`的方式:
+
+```objc
+@interface Dog : NSObject <Animal3>
+@property (nonatomic, assign) NSInteger uid;
+@property (nonatomic, assign) NSInteger age;
+@end
+@implementation Dog
+@end
+```
+
+```c
+Ivar ivar2 = class_getInstanceVariable([dog class], "_uid");
+Ivar ivar3 = class_getInstanceVariable([dog class], "_age");
+
+NSInteger uid = ((NSInteger (*)(id, Ivar))object_getIvar)(dog, ivar2);
+NSInteger age = ((NSInteger (*)(id, Ivar))object_getIvar)(dog, ivar3);
+```
+
+输出
+
+```
+(NSInteger) uid = 1111
+(NSInteger) age = 19
+```
+
+强制转换`object_getIvar()`的函数返回值类型，来取消对返回值默认当做objc对象。
 
 ## 对 `NSArray/NSSet/NSDictionary` 容器对象进行遍历的时候，转为CoreFoundation容器对象，再进行遍历，效率会更高。这也是struct作为Context的一个应用场景。
 
@@ -346,15 +743,17 @@ NSLog(@"info = %@", info);
 
 转换为CoreFoundation的写法，分为三部曲:
 
+### 第一步、定义每一次CF遍历回调c函数中使用的公共内存数据Context
+
 ```c
-// 定义每一次CF遍历回调c函数中使用的公共内存数据Context
 struct Context {
     void *info;    //注意：c struct中不能定义objc对象类型
 };
 ```
 
+### 第二步、定义每一次CFArray/CFSet/CFDictionary遍历回调的c函数实现
+
 ```c
-// 每一次CF遍历回调的c函数实现
 void XZHCFDictionaryApplierFunction(const void *key, const void *value, void *context) {
     //1.
     struct Context *ctx = (struct Context *)context;
@@ -371,8 +770,9 @@ void XZHCFDictionaryApplierFunction(const void *key, const void *value, void *co
 }
 ```
 
+### 第三步、将objc格式的NSArray/NSSet/NSDictionary转换为CF容器类型进行遍历
+
 ```objc
-// objc对象中转换为CF容器遍历
 @implementation ViewController
 
 - (void)test {
@@ -396,7 +796,9 @@ void XZHCFDictionaryApplierFunction(const void *key, const void *value, void *co
     ctx.info = (__bridge void*)(info);
 
     //5. 遍历容器，取出key、value、保存到公共数据中
-    CFDictionaryApplyFunction((CFDictionaryRef)map , XZHCFDictionaryApplierFunction, &ctx);
+    CFDictionaryApplyFunction((CFDictionaryRef)map,
+                          XZHCFDictionaryApplierFunction,
+                          &ctx);
 
     //6.
     NSLog(@"info = %@", info);
@@ -509,26 +911,31 @@ struct __touchDelegate {
 
 后后面只需要根据位段结构体实例的对应成员变量值是0还是1，就可以判断是否实现了协议方法。
 
-
-## struct实例，去持有 Foundation对象，当struct实例废弃时，要让Foundation对象在子线程上异步释放废弃
+## struct实例，持有`Foundation对象`。当struct实例废弃时，让Foundation对象在子线程上异步释放废弃
 
 ### 核心主要牵涉三个用于`c实例`与`objc对象`进行转换的东西
 
-一、`(__bridge_retained CoreFoundation实例)Foundation对象`
+#### `(__bridge_retained CoreFoundation实例)Foundation对象`
 
-- (1) Foundation对象 >>> CoreFoundation实例
-- (2) `[Foundation对象 retain]`
+```
+1. Foundation对象 >>> CoreFoundation实例
+2. [Foundation对象 retain]
+```
 
-二、`(__bridge_transfer Foundation对象)CoreFoundation实例`
+#### `(__bridge_transfer Foundation对象)CoreFoundation实例`
 
-- (1) CoreFoundation实例 >>> Foundation对象 
-- (2) `[Foundation对象 release]`
+```
+1. CoreFoundation实例 >>> Foundation对象 
+2. [Foundation对象 release]
+```
 
-三、`__bridge` 
+#### `__bridge` 
 
-- (1) Foundation对象 >>> CoreFoundation实例
-- (2) CoreFoundation实例 >>> Foundation对象 
-- (3) 不会执行任何的`retain/release`效果，仅仅只是类型的转换
+```
+1. Foundation对象 >>> CoreFoundation实例
+2. CoreFoundation实例 >>> Foundation对象 
+3. 不会执行任何的`retain/release`效果，仅仅只是类型的转换
+```
 
 ### 下面demo测试
 
@@ -545,7 +952,7 @@ Foundation 类
 @end
 ```
 
-struct实例 使用 `void*` 万能指针类型持有 Foundation对象
+struct实例 使用 `void*` 万能指针类型持有 Foundation对象，因为struct中不能写objc的NSObejct类型.
 
 ```c
 typedef struct DogsContext {
@@ -578,7 +985,9 @@ static DogsContext *_dogsCtx = NULL;
     
     //3. struct实例 持有 NSFoundation对象，并对oc对象进行retain，防止oc对象被废弃
     _dogsCtx->dogs = (__bridge_retained void*)dogs;
-}
+    //数组对象.retainCount==2（一个是局部指针dogs，另一个是通过 __bridge_retained）
+
+}//数组对象.retainCount==1（局部指针dogs超出作用域被释放）
 
 // 测试从结构体实例中取出oc对象使用，然后不再需要的时候全部一起废弃
 - (void)testARCBridge2 {
@@ -590,15 +999,19 @@ static DogsContext *_dogsCtx = NULL;
     }
     
     //2. 释放struct实例持有的NSMutableArray数组，继而释放掉了NSMutableArray数组持有的所有的Dogs对象
-    //2.1 对oc数组对象进行release
-    NSMutableArray *array2 = (__bridge_transfer NSMutableArray*)_dogsCtx->dogs;
+    
+    //2.1 使用 __bridge_transfer 对oc数组对象访问的同时进行release，
+    NSMutableArray *holder = (__bridge_transfer NSMutableArray*)_dogsCtx->dogs;
+    //数组对象.retainCount==1
+    
     //2.2 解决结构体实例指向oc数组对象，并废弃结构体实例
     _dogsCtx->dogs = NULL;
     free(_dogsCtx);
     _dogsCtx = NULL;
+    
     //2.3 子线程异步释放废弃oc数组内的其他子对象
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        [array2 class];
+        [holder class];//holder.retainCount == 0 标记废弃
     });
 }
 
@@ -629,13 +1042,6 @@ static DogsContext *_dogsCtx = NULL;
 2017-02-08 23:54:34.435 Test[1262:71700] 废弃Dog对象，name = name_3 on thread = <NSThread: 0x7ff0c8e68a50>{number = 2, name = (null)}
 ```
 
-
-## objc对象的成员变量的内存布局
-
-```
-objc对象的成员变量的内存布局.md
-```
-
 ## 将一些不太重要的代码放在 `idle（空闲）` 时去执行
 
 ```objc
@@ -645,17 +1051,17 @@ objc对象的成员变量的内存布局.md
  
 - (void)registerForIdleNotification  
 { 
-	//1. 关注通知 IdleNotification
+	//1. 让一段在空间时刻执行的代码，关注通知 IdleNotification时，再去执行
     [[NSNotificationCenter defaultCenter] addObserver:self 
         selector:@selector(idleNotificationMethod) 
-        name:@"IdleNotification" 
+        name:@"自定义通知的key" 
         object:nil]; 
         
-    //2. 构建通知
+    //2. 构建通知NSNotification
     NSNotification *notification = [NSNotification 
-        notificationWithName:@"IdleNotification" object:nil]; 
+        notificationWithName:@"自定义通知的key" object:nil]; 
 
-	//3. 异步发送通知，并使用空闲模式
+	//3. 在某个时刻，异步发送通知，并使用空闲模式，让之前的注册的代码执行
     [[NSNotificationQueue defaultQueue] enqueueNotification:notification 
     postingStyle:NSPostWhenIdle]; 
 }  
@@ -692,7 +1098,132 @@ objc对象的成员变量的内存布局.md
 }
 ```
 
-## 在线程的runloop添加2个Observer，用来给线程永远保持一个最新鲜的释放池
+对于自己创建的`NSThread`子线程，一定要手动创建释放池。
+
+## 给线程的runloop添加2个Observer，用来给线程永远保持一个最新鲜的释放池
+
+提供NSThread分类方法创建释放池的入口
+
+```objc
+// 标记是否创建过释放池
+static NSString *const kXZHNSThreadAutoleasePoolKey      = @"XZHNSThreadAutoleasePoolKey";
+
+// 标记存储释放池数组
+static NSString *const kXZHNSThreadAutoleasePoolStackKey = @"XZHNSThreadAutoleasePoolStackKey";
+
+@implementation NSThread (XZHAddtions)
+
++ (void)xzh_addAutoreleasePool {
+
+    //1. 主线程thread，会自己创建释放池
+    if ([NSThread isMainThread]) {return;}
+    
+    //2. 线程的字典对象
+    NSMutableDictionary *threadDic = [NSThread currentThread].threadDictionary;
+    
+    //2. 是否已经创建了释放池
+    if ([threadDic objectForKey:kXZHNSThreadAutoleasePoolKey]) {return;}
+    
+    //4. 给当前线程创建释放池
+    AutoreleasePoolSetup();
+    
+    //5. 标记当前线程已经创建了释放池
+    [threadDic setObject:kXZHNSThreadAutoleasePoolKey forKey:kXZHNSThreadAutoleasePoolKey];
+}
+
+@end
+```
+
+`AutoreleasePoolSetup()`完成给线程注册释放池，子线程的runloop添加两个observer.
+
+```c
+static void AutoreleasePoolSetup() {
+
+    //1. 给runloop添加第一个observer
+    AddRunLoopObserverForAutoreleasePoolPush();
+    
+    //2. 给runloop添加第二个observer
+    AddRunLoopObserverForAutoreleasePoolPop();
+}
+```
+
+给runloop添加第一个observer: `AddRunLoopObserverForAutoreleasePoolPush();`完成创建释放池，监听`kCFRunLoopEntry`，其oder最大，表示优先级最高
+
+```c
+static void AddRunLoopObserverForAutoreleasePoolPush() {
+    
+    /**
+     *  注意: 使用CoreFoundation版本的RunLoop的api，因为是线程安全的
+     */
+
+    //1. 获取/创建 当前线程的runloop
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    
+    //2. 创建 runloop observer，监听 `runloop进入`的状态
+    /*
+    创建runloop observer函数的参数意义:
+    CFRunLoopObserverCreate(CFAllocatorRef allocator,
+                            CFOptionFlags activities,//监听runloop的哪一个状态
+                            Boolean repeats,//重复性不断监听
+                            CFIndex order,//RunLoopObserver的优先级，当在Runloop同一运行阶段中有多个CFRunLoopObserver时，根据这个来先后调用，CFRunLoopObserver，默认值是0
+                            CFRunLoopObserverCallBack callout,//observer回调c函数
+                            CFRunLoopObserverContext *context);//用于给observer回调c函数中，传递参数的context
+     */
+    
+    /**
+     *  observer的优先级最大:
+     *  0x7FFFFFFF是一个十六进制数
+     *  转成二进制数==>0111,1111,1111,1111,1111,1111,1111,1111==>32位二进制数，第一位0，表示正数
+     *  而int类型变量占用32个二进制位，第一位是符号位（表示正负数），后面31位是数值位
+     *  所以，0x7FFFFFFF表示最大的int类型正数，也可以使用 INT_MAX 代替
+     */
+    CFIndex order = 0x7FFFFFFF;
+    CFRunLoopObserverRef pushObserver = NULL;
+    pushObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
+                                           kCFRunLoopEntry,
+                                           true,
+                                           order,
+                                           XZHCFRunLoopObserverCallBack,
+                                           NULL);
+    
+    //3. observer注册给runloop，注意runloop mode >>> commom modes
+    CFRunLoopAddObserver(runLoop, pushObserver, kCFRunLoopCommonModes);
+    
+    //4.
+    CFRelease(pushObserver);
+}
+```
+
+给runloop添加第二个observer: `AddRunLoopObserverForAutoreleasePoolPop();`完成释放释放池，监听`kCFRunLoopBeforeWaiting 与 kCFRunLoopExit`，其oder最`小`，表示优先级最`低`
+
+```c
+static void AddRunLoopObserverForAutoreleasePoolPop() {
+
+    //1.
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    
+    //2. runloop observer 优先级最低:
+    CFIndex order = -0x7FFFFFFF;
+    
+    //3. 监听runloop状态: 休眠、退出执行
+    CFRunLoopObserverRef popObserver = NULL;
+    popObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
+                                          kCFRunLoopBeforeWaiting | kCFRunLoopExit,
+                                          true,
+                                          order,
+                                          XZHCFRunLoopObserverCallBack,
+                                          NULL);
+    
+    //4.
+    CFRunLoopAddObserver(runLoop, popObserver, kCFRunLoopCommonModes);
+    
+    //5.
+    CFRelease(popObserver);
+}
+```
+
+两个observer统一走的回调函数
+
 
 ```c
 static void XZHCFRunLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *context)
@@ -727,693 +1258,86 @@ static void XZHCFRunLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoo
 
 从上面的逻辑可以看出，主要是三种状态：
 
-- (1) runloop即将进入，也就是runloop的第一次初始化的时候
-- (2) runloop即将睡眠，就是处理完当前所有的source了，已经没有其他事情了
-- (3) runloop即将退出
+- (1) runloop即将进入，直接创建释放池
+- (2) runloop即将睡眠，先释放掉老的释放池，再重新创建一个新的释放池
+- (3) runloop即将退出，直接释放持有的释放池
+
+`XZHAutoreleasePoolPush()`  直接创建新的释放池
+
+```c
+static inline void XZHAutoreleasePoolPush() {
+    
+    //1. 读取线程对象的字典
+    NSMutableDictionary *dic =  [NSThread currentThread].threadDictionary;
+
+    //2. 获取线程对象存储的pool数组对象
+    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([dic objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
+    
+    //3. 如果pool数组不存在，则先创建数组对象，并存入到线程字典对象中
+    if (!autoreleasePools) {
+        autoreleasePools = CFArrayCreateMutable(kCFAllocatorDefault, 1, NULL);
+        [dic setObject:(__bridge id)(autoreleasePools) forKey:kXZHNSThreadAutoleasePoolStackKey];
+        CFRelease(autoreleasePools);
+    }
+    
+    //4. 创建新的pool对象，并加入到数组最后一个位置
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    CFArrayAppendValue(autoreleasePools, (__bridge void*)(pool));
+}
+```
+
+`XZHAutoreleasePoolPop()`完成释放掉现在的释放池
+
+```c
+static inline void XZHAutoreleasePoolPop() {
+
+    //1. 获取线程对象存储的pool数组对象
+    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([[NSThread currentThread].threadDictionary objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
+    
+    //2. 获取最后的一个pool
+    NSAutoreleasePool *lastPool = CFArrayGetValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
+    
+    //3. 清除pool中的所有的对象
+    [lastPool drain];
+    
+    //4. 移除pool
+    CFArrayRemoveValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
+}
+```
+
+## CoreAnimation界面重绘的过程
+
+- (1) 注册关注MainRunLoop的如下状态改变，是MainRunLoop最清闲的时候
+	- `kCFRunLoopBeforeWaiting` 即将休息
+	- `kCFRunLoopExit` 即将退出
+
+- (2) 即将重绘的UIView对象、哪一个属性值（font、textColor、backgroudColor...） 被CoreAnimation打包为一个`CATransaction`对象
+	- (2.1) 指定哪一个UIView对象的CALayer
+	- (2.2) 要触发哪一个属性值（font、textColor、backgroudColor...）的重绘
+	- (2.3) `[CATransaction commit]` 提交
+
+- (3) CATransaction提交后，只是暂时保存到一个临时缓存区，类似于NSSet集合
+
+- (4) 等待MainRunLoop处于`kCFRunLoopBeforeWaiting 或 kCFRunLoopExit`状态回调时，再将上面的存放在临时缓存区中的`CATransaction对象的消息发送事件`，**注册**到MainRunLoop
+	- 只是注册到MainRunLoop，而MainRunLoop并不会立刻去处理消息发送
+	- 注册完毕，MainRunLoop休息了
+	
+- (5) 等待MainRunLoop被唤醒，开始新的一轮回时，就会处理上一轮回注册的`CATransaction对象的消息发送事件`
+
+利用了RunLoop处于最清闲的时刻，将多个重绘操作，按照RunLoop的每一个轮回，切割为多个批次进行重绘。
+
 
 ## 对象关联时所有内存管理策略
 
 | 关联对象指定的内存策略 | 等效的OC对象内存管理修饰符  | 
 | :-------------: |:-------------:| 
-| `OBJC_ASSOCIATION_ASSIGN` | atomic + assign |
-| `OBJC_ASSOCIATION_RETAIN_NONATOMIC` | nonatimic + retain |
-| `OBJC_ASSOCIATION_COPY_NONATOMIC` | nonatimic + copy |
-| `OBJC_ASSOCIATION_RETAIN` | atomic + retain |
-| `OBJC_ASSOCIATION_COPY` | atomic + copy |
+| `OBJC_ASSOCIATION_ASSIGN` | **atomic + assign** |
+| `OBJC_ASSOCIATION_RETAIN_NONATOMIC` | **nonatimic + retain** |
+| `OBJC_ASSOCIATION_COPY_NONATOMIC` | **nonatimic + copy** |
+| `OBJC_ASSOCIATION_RETAIN` | **atomic + retain** |
+| `OBJC_ASSOCIATION_COPY` | **atomic + copy** |
 
 没有指定`nonatomic`，默认就是`atomic`原子属性同步多线程。
-
-## `IMP Caching`: 使用 `methodForSelector:` 获取objc方法 IMP，然后缓存起来。以后每次调用该oc函数时，直接使用IMP
-
-首先，有一个测试类:
-
-```objc
-@interface Person : NSObject
-+ (void)logName1:(NSString *)name;
-- (void)logName2:(NSString *)name;
-@end
-@implementation Person
-+ (void)logName1:(NSString *)name {
-    NSLog(@"log1 name = %@", name);
-}
-- (void)logName2:(NSString *)name {
-    NSLog(@"log2 name = %@", name);
-}
-@end
-```
-
-然后ViewController测试IMP Caching:
-
-```c
-#import <objc/runtime.h>
-
-static id PersonClass = nil;
-static SEL PersonSEL1;
-static SEL PersonSEL2;
-static IMP PersonIMP1;
-static IMP PersonIMP2;
-
-@implementation ViewController
-
-+ (void)initialize {
-    PersonClass = [Person class];
-   
-    PersonSEL1 = @selector(logName1:);
-    PersonSEL2 = @selector(logName2:);
-    
-    //获取类方法实现
-    PersonIMP1 = [PersonClass methodForSelector:PersonSEL1];
-    
-    //获取对象方法实现
-    PersonIMP2 = method_getImplementation(class_getInstanceMethod(PersonClass, PersonSEL2));
-}
-
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-
-    //1. 调用类方法实现
-    ((void (*)(id, SEL, NSString*)) (void *) PersonIMP1)(PersonClass, PersonSEL1, @"我是参数");
-    
-    //2. 调用对象方法实现
-    ((void (*)(id, SEL, NSString*)) (void *) PersonIMP2)([Person new], PersonSEL2, @"我是参数");
-    
-    NSLog(@"");
-}
-
-@end
-```
-
-输出结果
-
-```
-2017-02-08 22:47:46.586 Test[805:25490] log1 name = 我是参数
-2017-02-08 22:47:46.587 Test[805:25490] log2 name = 我是参数
-```
-
-## objc消息转发阶段总结
-
-<img src="./forwardinvocation.png" alt="" title="" width="700"/>
-
-##  `_objc_msgForward` iOS系统消息转发c函数指针
-
-还有与之差不多意思的:
-
-```c
-_objc_msgForward_stret
-```
-
-jspatch恰恰就是利用的这个`_objc_msgForward`c方法实现，达到交换任意Method的SEL指向的IMP。
-
-当一个oc类中，找不到某一个SEL对应的IMP时，会进入到系统的消息转发函数。
-
-下面测试下，`_objc_msgForward`到底是如何转发消息的？
-
-首先，有如下测试类:
-
-```objc
-@interface Person : NSObject
-+ (void)logName1:(NSString *)name;
-- (void)logName2:(NSString *)name;
-@end
-@implementation Person
-+ (void)logName1:(NSString *)name {
-    NSLog(@"log1 name = %@", name);
-}
-- (void)logName2:(NSString *)name {
-    NSLog(@"log2 name = %@", name);
-}
-@end
-```
-
-ViewController中随便执行一个Perosn对象不存在实现的SEL消息:
-
-```objc
-@implementation ViewController
-
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-
-    // 此处打一个断点，然后执行下面的lldb调试命令后，再往下执行代码
-    static Person *person;
-    person = [Person new];
-    [person performSelector:@selector(hahahaaha)];
-    
-    NSLog(@"");
-}
-
-@end
-```
-
-断点后，在lldb中输入如下调试命令，会打印出所有运行时发送的消息:
-
-```c
-(lldb) call (void)instrumentObjcMessageSends(YES)
-```
-
-程序崩溃后，进入Mac电脑系统如下目录:
-
-```c
-cd /tmp/
-```
-
-找到该目录下类似如下结构的文件，然后打开
-
-```
-msgSends-901
-```
-
-打开文件后，只看与`Person`相关的信息大概为如下:
-
-```objc
-+ Person NSObject initialize
-+ Person NSObject new
-- Person NSObject init
-- Person NSObject performSelector:
-+ Person NSObject resolveInstanceMethod:
-+ Person NSObject resolveInstanceMethod:
-- Person NSObject forwardingTargetForSelector:
-- Person NSObject forwardingTargetForSelector:
-- Person NSObject methodSignatureForSelector:
-- Person NSObject methodSignatureForSelector:
-- Person NSObject class
-- Person NSObject doesNotRecognizeSelector:
-- Person NSObject doesNotRecognizeSelector:
-- Person NSObject class
-```
-
-从`Person NSObject performSelector:`开始执行一个不存在实现SEL消息后，依次开始执行:
-
-- (1) `resolveInstanceMethod:`
-- (2) `forwardingTargetForSelector:`
-- (3) `methodSignatureForSelector:`
-
-所以，`_objc_msgForward`这个指针指向的c函数的作用，就是进入到消息转发阶段，从阶段1到阶段2，如果最后阶段仍然无法处理消息，就产生异常让程序退出。
-
-## 限制无限去创建 gcd dispatch queue
-
-YYDispatchQueuePool的核心几点:
-
-- (1) iOS8之前使用Priority，iOS8及之后使用QualityOfService，来操作`dispatch_queue_t`
-
-- (2) 根据 Priority或iOS8及之后使用QualityOfService，不同的各种等级，分别创建一个Context内存块
-
-- (3) 每一个Context内存块，保存`[NSProcessInfo processInfo].activeProcessorCount`个 dispatch serial queue实例
-
-- (4) 根据对应的等级，从对应的Context中，随机取出一个dispatch serial queue实例，进行任务调度
-
-- (5) 一个`dispatch serial queue实例`，就是`一个`底层线程
-
-- (6) 一个`dispatch concurrent queue实例`，就是`n个`底层线程
-
-这样避免无限制的创建dispatch queue实例，导致底层线程也会无限制的创建，没有办法复用。
-
-并且每一种Context下，预先缓存`当前CPU硬件激活的核心数`个dispatch queue实例，可以让CPU在该Context等级下，满负荷运行，让CPU充分利用。
-
-而不会因为线程太多，导致CPU在多线程之间切换、竞争消耗无畏的资源。
-
-### 注意如果直接对NSThread进行缓存，一定要做如下几件事
-
-- (1) 获取NSThread对象的RunLoop（完成RunLoop的创建与绑定）
-- (2) 给RunLoop添加RunLoopSource监听的事件源（随便加一个NSMachPort）
-- (3) 让NSThread的`-[NSRunLoop run]`
-
-这样，这个NSThread对象的状态，才会一直处于执行状态，即使`isExecuting == YES`，这样也才能让这个NSThread对象，永远的随时随刻接收任务执行。
-
-但是如果直接对`dispatch_queue_t`实例，进行缓存的话，是不需要我们手动做上面的一些事情的，我估计是GCD底层线程池已经做了处理。
-
-## `@package`块声明ivar
-
-让一些Ivar只想在`静态类库`或`framework`中的类对象中的代码可以访问。
-
-
-## 主线程上常见比较耗时的代码类型:
-
-- (1) Layout 布局计算
-	- 计算文本内容的 宽度计算、高度计算
-	- UI对象的 frmae计算、frmae设置、frmae调整
-
-- (2) Rendering 显示数据渲染
-	- 文本内容的渲染
-	- 图片的解码
-	- 图形的绘制
-
-- (3) UIKit Obejcts UI对象
-	- UI对象的属性值调整
-	- UI对象的创建
-	- UI对象的销毁（废弃）
-
-
-## `hitTest:withEvent:` 与 `pointInside:withEvent:`
-
-### 关于`-[UIView hitTest:withEvent:]`的源码大致实现
-
-```objc
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
-{
-    // 1. 判断自己是否能够接收触摸事件（是否打开事件交互、是否隐藏、是否透明）
-    if (self.userInteractionEnabled == NO || self.hidden == YES || self.alpha <= 0.01) return nil;
-    
-    // 2. 调用 pointInside:withEvent:， 判断触摸点在不在自己范围内（frame）
-    if (![self pointInside:point withEvent:event]) return nil;
-    
-    // 3. 从`上到下`（最上面开始）遍历自己的所有子控件，看是否有子控件更适合响应此事件
-    int count = self.subviews.count;
-    for (int i = count - 1; i >= 0; i--) {
-        UIView *childView = self.subviews[i];
-        
-        // 将产生事件的坐标，转换成当前相对subview自己坐标原点的坐标
-        CGPoint childPoint = [self convertPoint:point toView:childView];
-        
-        // 又继续交给每一个subview去hitTest
-        UIView *fitView = [childView hitTest:childPoint withEvent:event];
-        
-        // 如果childView的subviews存在能够处理事件的，就返回当前遍历的childView对象作为事件处理对象
-        if (fitView) {
-            return fitView;
-        }
-    }
-    
-    //4. 没有找到比自己更合适的view
-    return self;
-}
-```
-
-可以看到这个`hitTest:withEvent:`函数实现，主要就是测试这个UIView对象，到底能不能够处理这个UI触摸事件。
-
-执行`hitTest:`的层次顺序如下:
-
-```
-- UIApplication
-	- UIWindow
-		- RootView
-			- Subviews[n-1]
-			- Subviews[n-2] 
-			- ....
-			- Subviews[0]
-```
-
-### 使用Category Associate 扩大UI的事件响应区域
-
-```objc
-#import <UIKit/UIKit.h>
-
-@interface UIButton (EnlargeTouchArea)
-
-/**
- *  设置按钮上下左右的扩展响应区域
- */
-- (void)setEnlargeEdgeWithTop:(CGFloat)top
-                        right:(CGFloat)right
-                       bottom:(CGFloat)bottom
-                         left:(CGFloat)left;
-
-@end
-```
-
-```
-#import "UIButton+EnlargeTouchArea.h"
-#import <objc/runtime.h>
-
-static void *kButtonUpKey = &kButtonUpKey;
-static void *kButtonLeftKey = &kButtonLeftKey;
-static void *kButtonDownKey = &kButtonDownKey;
-static void *kButtonRightKey = &kButtonRightKey;
-
-@implementation UIButton (EnlargeTouchArea)
-
-- (void)setEnlargeEdgeWithTop:(CGFloat)top right:(CGFloat)right bottom:(CGFloat)bottom left:(CGFloat)left
-{
-    objc_setAssociatedObject(self, kButtonUpKey, @(top), OBJC_ASSOCIATION_ASSIGN);
-    objc_setAssociatedObject(self, kButtonLeftKey, @(left), OBJC_ASSOCIATION_ASSIGN);
-    objc_setAssociatedObject(self, kButtonDownKey, @(bottom), OBJC_ASSOCIATION_ASSIGN);
-    objc_setAssociatedObject(self, kButtonRightKey, @(right), OBJC_ASSOCIATION_ASSIGN);
-}
-
-- (CGRect) enlargedRect
-{
-    NSNumber* topEdge = objc_getAssociatedObject(self, &kButtonUpKey);
-    NSNumber* rightEdge = objc_getAssociatedObject(self, &kButtonRightKey);
-    NSNumber* bottomEdge = objc_getAssociatedObject(self, &kButtonDownKey);
-    NSNumber* leftEdge = objc_getAssociatedObject(self, &kButtonLeftKey);
-    
-    if (topEdge && rightEdge && bottomEdge && leftEdge)
-    {
-        // 上下左右分别扩大响应区域
-        return CGRectMake(
-                          self.bounds.origin.x - leftEdge.floatValue,
-                          self.bounds.origin.y - topEdge.floatValue,
-                          self.bounds.size.width + leftEdge.floatValue + rightEdge.floatValue,
-                          self.bounds.size.height + topEdge.floatValue + bottomEdge.floatValue
-                          );
-    } else {
-        return self.bounds;
-    }
-}
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    
-    // 扩大后的响应区域
-    CGRect rect = [self enlargedRect];
-    
-    // 如果扩大的响应区域 == 当前自身的响应区域，直接执行父类的事件处理
-    if (CGRectEqualToRect(rect, self.bounds))
-    {
-        return [super hitTest:point withEvent:event];
-    }
-    
-    // 扩大的响应区域 > 当前自身的响应区域
-    return CGRectContainsPoint(rect, point) ? self : nil;
-}
-
-@end
-```
-
-## 位移枚举 + Mask掩码
-
-这种枚举适用于一个统一的枚举类型来定义，具备:
-
-- (1) 多种情况
-- (2) 每一种情况，又分为其他的小情况
-
-一个简单的demo
-
-
-```objc
-typedef NS_OPTIONS(NSInteger, PersonState) {
-	
-	// 第一种类型: 占用1~8位的二进制位，掩码是 1111,1111
-    PersonStateMask                     = 0xFF,//1-8位的掩码（十六进制数，一个数代表4位，F:1111，0:0000）
-    PersonStateUnknown                  = 0,
-    PersonStateAlive                    = 1,
-    PersonStateWork                     = 2,
-    PersonStateDead                     = 3,
-
-	// 第二种类型: 占用9~16位的二进制位，掩码是 1111,1111,0000,0000   
-    HouseStateMask                      = 0xFF00,//9-16位，左移8位
-    HouseStateNone                      = 1 << 8,
-    HouseStateSmall                     = 1 << 9,
-    HouseStateBig                       = 1 << 10,
-    
-	// 第三种类型: 占用17~24位的二进制位，掩码是 1111,1111,0000,0000,0000,0000   
-    CarStateMask                        = 0xFF0000,//17-24位，左移16位
-    CarStateNone                        = 1 << 16,
-    CarStateSmall                       = 1 << 17,
-    CarStateBig                         = 1 << 18,
-};
-```
-
-如下就是分别获取得到 1~8位、9~16位、17~24位 这三个区段的所谓的Mask掩码
-
-```c
-0xFF		>>> 1111,1111 >>> 获取低8位值
-0xFF00 		>>> 1111,1111,0000,0000 >>> 获取9-16位值
-0xFF0000  	>>> 1111,1111,0000,0000,0000,0000 >>> 获取17-24位值
-```
-
-使用当前的枚举混合值，通过与Mask掩码，进行`按位与`获取Mask掩码对应长度的值:
-
-```c
-(1) & 上 `FF` 获取低8位的值
-(2) & 上 `FF00` 获取第9位到16位的值
-(3) & 上 `FF0000` 获取第17位到24位的值
-```
-
-示例代码
-
-```c
-//1.
-PersonState state = PersonStateUnknown;
-
-//2.
-state = PersonStateDead;
-
-//3.
-state = state | HouseStateBig;
-NSLog(@"state = %ld", state);
-NSLog(@"person state = %ld", state & PersonStateMask);
-NSLog(@"house state = %ld", state & HouseStateMask);
-
-//4.
-state = state | CarStateBig;
-
-//5. 
-NSLog(@"state = %ld", state);
-NSLog(@"person state = %ld", state & PersonStateMask);
-NSLog(@"house state = %ld", state & HouseStateMask);
-NSLog(@"car state = %ld", state & CarStateMask);
-```
-
-## `-[NSObject class]`、`+[NSObject class]`、`objc_getClass(<#const char *name#>)`的区别
-
-### `-[NSObject class]`源码实现
-
-```c
-- (Class) class
-{
-  return object_getClass(self);
-}
-```
-
-### `+[NSObject class]`源码实现
-
-```c
-+ (Class) class
-{
-  return self;
-}
-```
-
-### `objc_getClass(<#const char *name#>)`源码实现
-
-```c
-Class object_getClass(id obj)
-{
-    if (obj) return obj->getIsa();//读取的是isa指针，所指向的objc_class实例
-    else return Nil;
-}
-```
-
-## Cache缓存数据、在多线程环境下使用的代码模板
-
-```objc
-@interface ClassMapper : NSObject
-@end
-
-@implementation ClassMapper
-+ (instancetype)mapperWithClass:(Class)cls {
-    if (Nil == cls) {return nil;}
-    
-    /**
-     *  1. 单例模板控制缓存正确初始化、信号值为1的信号量初始化
-     */
-    static CFMutableDictionaryRef       _cache = NULL;
-    static dispatch_semaphore_t         _semephore = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        _cache = CFDictionaryCreateMutable(kCFAllocatorDefault, 32, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        _semephore = dispatch_semaphore_create(1);
-    });
-    
-    /**
-     *  2. 先查询缓存
-     */
-    const void *clsName =  (__bridge const void *)(NSStringFromClass(cls));
-    dispatch_semaphore_wait(_semephore, DISPATCH_TIME_FOREVER);
-    ClassMapper *clsMapper = CFDictionaryGetValue(_cache, clsName);
-    dispatch_semaphore_signal(_semephore);
-    
-    /**
-     *  3. 如果有缓存就直接返回，如果没有缓存则创建新的对象并完成缓存
-     */
-    if (!clsMapper) {
-        clsMapper = [ClassMapper new];
-        
-        dispatch_semaphore_wait(_semephore, DISPATCH_TIME_FOREVER);
-        CFDictionarySetValue(_cache, clsName, (__bridge const void *)(clsMapper));
-        dispatch_semaphore_signal(_semephore);
-
-    }
-
-    return clsMapper;;
-}
-@end
-```
-
-
-## Category不会`覆盖`原始方法实现，以及多个Category重写相同的方法实现的调用顺序
-
-### 主要涉及的问题
-
-```
-1. Category是否会覆盖原始Class中的Method？
-2. 多个Category添加相同的Method，调用顺序是什么？
-```
-
-### 一、Category中重写原始类中已经存在的方法实现时
-
-- (1) Category中重写的Method，肯定会排在原始类的Method的`最前面`
-
-- (2) 每当从编译路径中读取到Category重写的Method，就会将这个重写的Method采用`头插法`插入到原始类的`method_list`的`第一个`位置
-
-也就是说，越在后面编译的Category中重写的Method，却会出现在`method_list`的第一个位置
-	
-### 二、多个Category中，都重写了相同的方法实现时
-
-会按照Category在编译路径中的顺序，将Method依次`头插`到原始类的`method_list`单链表中。
-
-所以，也就是Category出现的越晚，重写的Method就会出现在第一个位置。
-
-具体测试，搜索`Category覆盖原始类中的方法实现存在的问题.md`。
-
-## 触发CPU与GPU的离屏渲染的场景
-
-### CPU触发离屏渲染
-
-- (1) 使用`CoreGraphics`库函数进行绘制图像
-
-- (2) 重写`-[UIView drawRect]`方法实现中写的任何绘制代码
-    - 甚至是`空方法实现`也会触发
-
-### GPU触发离屏渲染
-
-- (1) CALayer对象设置 shouldRasterize（光栅化）
-
-- (2) CALayer对象设置 masks（遮罩）
-
-- (3) CALayer对象设置 shadows（阴影）
-
-- (4) CALayer对象设置 group opacity（不透明）
-
-- (5) 所有`文字`的绘制（UILabel、UITextView...），包括`CoreText`绘制文字、`TextKit`绘制文字
-
-
-尽量避免GPU离屏渲染，但是为了能够异步进行绘制，也有可能操作CPU离屏渲染。
-
-### 但是最好这两种离屏渲染都不做，对于上面两种离屏渲染的针对性处理:
-
-- (1) CPU的离屏渲染 >>> 尽量的使用`专用图层`（CATextLayer...）
-- (2) GPU的离屏渲染 >>> 尽量`提前在子线程上异步`完成文本、图形、图像的`渲染`
-
-参见`CoreText三、CoreText基础、使用、优化.md`。
-
-
-## 最好不要重写`-[UIView drawRect:]`来完成文本、图形的绘制，而是使用`专用图层`来专门完成绘制
-
-### 首先清楚，CPU与GPU的强项与弱势：
-
-- (1) CPU、对数据的计算处理相当快，但是对于图像的渲染很差
-- (2) GPU、有很多核心来同时做图像的渲染，所以很快。但是对于数据的计算处理，是很慢的
-
-
-所以，一定要充分利用GPU与CPU的强项：
-
-```
-CPU >>> 大量进行数据计算，少进行图像渲染
-GPU >>> 大量进行图像渲染，少进行数据计算
-```
-
-- (1) `OpenGL`绘制图像，会交给`GPU`完成渲染
-- (2) `CoreGraphics`绘制图像，会交给`CPU`完成渲染
-
-所以，最好让CPU只做一些`数据计算`，而CPU只会`图像渲染`，这样整体性能会提升很多。
-
-### 为什么不要重写`drawRect:` 
-
-- (1) 只要重写`drawRect:`，就会给layer创建一个`空的宿主图像`而浪费内存
-
-- (2) `CoreGraphics`的图像绘制，会触发`CPU的离屏渲染`，而CPU的`图像渲染`能力是很差的，会影响CPU的执行效率
-
-- (3) `专用图层`把图像渲染代码使用OpenGL操作`GPU`来完成图像的渲染，内存优化
-
-下面是使用专用图层来绘制自定义路径的代码模板，`代替`使用重写`drawRect:`
-
-```objc
-@implementation XingNengVC {
-    UIView  *_bottomView;
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    
-    //1. 创建UIView容器
-    _bottomView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 200)];
-    [self.view addSubview:_bottomView];
-    
-    //2. 创建具体绘制图像的专用图层
-    CAShapeLayer *layer = [CAShapeLayer layer];
-    layer.frame = _bottomView.bounds;
-    
-    //3. 设置要绘制的图像路径
-    UIBezierPath *path = [[UIBezierPath alloc] init];
-    [path moveToPoint:CGPointMake(175, 100)];
-    [path addArcWithCenter:CGPointMake(150, 100) radius:25 startAngle:0 endAngle:2*M_PI clockwise:YES];
-    [path moveToPoint:CGPointMake(150, 125)];
-    [path addLineToPoint:CGPointMake(150, 175)];
-    [path addLineToPoint:CGPointMake(125, 225)];
-    [path moveToPoint:CGPointMake(150, 175)];
-    [path addLineToPoint:CGPointMake(175, 225)];
-    [path moveToPoint:CGPointMake(100, 150)];
-    [path addLineToPoint:CGPointMake(200, 150)];
-    
-    //4. 将要绘制的路径设置给layer
-    layer.path = path.CGPath;
-    
-    //3.
-    [_bottomView.layer addSublayer:layer];
-}
-
-@end
-```
-
-## objc对象的`释放`与`废弃`，是两个`不同的阶段`
-
-### 释放
-
-应该是释放对象的`持有`，即对objc对象发送`retain\release\autorelase`等消息，修改objc对象的`retainCount`值，但是对象的内存一直都还存在。
-
-释放持有的操作，是`同步`的。
-
-### 废弃
-
-当某个`空闲`时间，系统才会将内存的数据全部擦除干净，然后将这块内存`合并为系统未使用的内存`中。而此时如果程序继续访问该内存块，就会造成程序崩溃。
-
-内存的彻底`废弃`操作，是`异步`的，也就是说有一定的`延迟`。
-
-
-### 执行了`-[NSObject dealloc]`，并不是说对象所在内存就被`废弃`了。只是对于常理来说，这个对象已经`标记`为即将废弃，程序中也不要再继续使用了。
-
-
-```objc
-- (void)testMRC {
-
-    _mrc = [[MRCTest alloc] init];
-    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
-    
-    MRCTest *tmp1 = [_mrc retain];
-    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
-    
-    [_mrc release];
-    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
-    
-    [tmp1 release];
-    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
-    
-    //【重要】尝试多次输出retainCount
-    for (NSInteger i = 0; i < 10; i++) {
-        NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);//【重要】循环执行几次之后，崩溃到此行
-    }
-}
-```
-
-运行之后，结果崩溃到for循环中的第二次或第三次循环，`程序崩溃`报错如下:
-
-```
-thread 1:EXC_BAD_ACCESS .... 
-```
-
-释放掉对象之后，指向该对象的指针，仍然会保留在局部方法块的所在栈中，仍然是可以在短暂的时间内继续通过指针访问到对象。但是超过一定时间后，对象才会被彻底废弃掉，这个时候如果还去使用这个指针就会造成程序崩溃。
-
-那这样是说最终对象的内存废弃过程，是一个`异步`执行的吗？或者说有一定的`延迟时间`吗？
-
-是`延迟`的，因为最终对象内存会被擦除掉，并与系统内存合并到一起，所以这个过程确实是一个异步的。
 
 ## 属性修饰符与对象所有权修饰符的关系
 
@@ -1628,7 +1552,600 @@ id objc_retainAutoreleasedReturnValue(id obj)
 
 基本上就可以看明白`objc_autoreleaseReturnValue(id obj)`与`objc_retainAutoreleasedReturnValue(id obj)`这一对函数，在返回值为objc对象时，做的优化了。
 
-两个函数配合起来，`禁止`返回值objc对象被注册到`autorelease pool`的多余过程。		
+两个函数配合起来，`禁止`返回值objc对象被注册到`autorelease pool`的多余过程。	
+
+## objc消息转发阶段总结
+
+<img src="./forwardinvocation.png" alt="" title="" width="700"/>
+
+##  `_objc_msgForward` iOS系统消息转发c函数指针
+
+还有与之差不多意思的:
+
+```c
+_objc_msgForward_stret
+```
+
+jspatch恰恰就是利用的这个`_objc_msgForward`c方法实现，达到交换任意Method的SEL指向的IMP。
+
+当一个oc类中，找不到某一个SEL对应的IMP时，会进入到系统的消息转发函数。
+
+下面测试下，`_objc_msgForward`到底是如何转发消息的？
+
+首先，有如下测试类:
+
+```objc
+@interface Person : NSObject
++ (void)logName1:(NSString *)name;
+- (void)logName2:(NSString *)name;
+@end
+@implementation Person
++ (void)logName1:(NSString *)name {
+    NSLog(@"log1 name = %@", name);
+}
+- (void)logName2:(NSString *)name {
+    NSLog(@"log2 name = %@", name);
+}
+@end
+```
+
+ViewController中随便执行一个Perosn对象不存在实现的SEL消息:
+
+```objc
+@implementation ViewController
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+
+    // 此处打一个断点，然后执行下面的lldb调试命令后，再往下执行代码
+    static Person *person;
+    person = [Person new];
+    [person performSelector:@selector(hahahaaha)];
+    
+    NSLog(@"");
+}
+
+@end
+```
+
+断点后，在lldb中输入如下调试命令，会打印出所有运行时发送的消息:
+
+```c
+(lldb) call (void)instrumentObjcMessageSends(YES)
+```
+
+程序崩溃后，进入Mac电脑系统如下目录:
+
+```c
+cd /tmp/
+```
+
+找到该目录下类似如下结构的文件，然后打开
+
+```
+msgSends-901
+```
+
+打开文件后，只看与`Person`相关的信息大概为如下:
+
+```objc
++ Person NSObject initialize
++ Person NSObject new
+- Person NSObject init
+- Person NSObject performSelector:
++ Person NSObject resolveInstanceMethod:
++ Person NSObject resolveInstanceMethod:
+- Person NSObject forwardingTargetForSelector:
+- Person NSObject forwardingTargetForSelector:
+- Person NSObject methodSignatureForSelector:
+- Person NSObject methodSignatureForSelector:
+- Person NSObject class
+- Person NSObject doesNotRecognizeSelector:
+- Person NSObject doesNotRecognizeSelector:
+- Person NSObject class
+```
+
+从`Person NSObject performSelector:`开始执行一个不存在实现SEL消息后，依次开始执行:
+
+- (1) `resolveInstanceMethod:` or `resolveClassMethod:`
+- (2) `forwardingTargetForSelector:`
+- (3) `methodSignatureForSelector:`
+- (4) `forwardInvocation:`
+
+所以，`_objc_msgForward`这个指针指向的是，负责完成整个objc消息转发的c函数实现，包括`阶段1、阶段2`。
+
+如果最后阶段`forwardInvocation:`仍然无法处理消息，就产生异常让程序退出。
+
+## `串行 dispatch_queue_t` 缓存池 
+
+对于串行与并发队列的区别:
+
+- (1) 一个`dispatch serial queue实例`，就是`一个`底层线程
+
+- (2) 一个`dispatch concurrent queue实例`，就是`n个`底层线程
+
+YYDispatchQueuePool的核心几点:
+
+- (1) iOS8之前使用Priority，iOS8及之后使用QualityOfService，来操作`dispatch_queue_t`
+
+- (2) 根据 Priority或iOS8及之后使用QualityOfService，不同的各种等级，分别创建一个Context内存块
+
+- (3) 每一个Context内存块，保存`[NSProcessInfo processInfo].activeProcessorCount`个 `dispatch serial queue`实例，让CPU的核心充分利用
+
+- (4) 根据对应的等级，从对应的Context中，随机取出一个dispatch serial queue实例，进行任务调度
+
+### 注意如果直接对NSThread进行缓存，一定要做如下几件事
+
+- (1) 获取NSThread对象的RunLoop（完成RunLoop的创建与绑定）
+- (2) 给RunLoop添加RunLoopSource监听的事件源（随便加一个NSMachPort）
+- (3) 让NSThread的`-[NSRunLoop run]`
+
+这样，这个NSThread对象的状态，才会一直处于执行状态，即使`isExecuting == YES`，这样也才能让这个NSThread对象，永远的随时随刻接收任务执行。
+
+但是如果直接对`dispatch_queue_t`实例，进行缓存的话，是不需要我们手动做上面的一些事情的，我估计是GCD底层线程池已经做了处理。
+
+## `@package`块声明ivar
+
+这一类的iavr，可以再当前`.m`中任意进行访问。
+让一些Ivar只想在`静态类库`或`framework`中的类对象中的代码可以访问。
+
+
+## `hitTest:withEvent:` 与 `pointInside:withEvent:`
+
+### 关于`-[UIView hitTest:withEvent:]`的源码大致实现
+
+```objc
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+{
+    // 1. 判断自己是否能够接收触摸事件（是否打开事件交互、是否隐藏、是否透明）
+    if (self.userInteractionEnabled == NO || self.hidden == YES || self.alpha <= 0.01) return nil;
+    
+    // 2. 调用 pointInside:withEvent:， 判断触摸点在不在自己范围内（frame）
+    if (![self pointInside:point withEvent:event]) return nil;
+    
+    // 3. 从`上到下`（最上面开始）遍历自己的所有子控件，看是否有子控件更适合响应此事件
+    int count = self.subviews.count;
+    for (int i = count - 1; i >= 0; i--) {
+        UIView *childView = self.subviews[i];
+        
+        // 将产生事件的坐标，转换成当前相对subview自己坐标原点的坐标
+        CGPoint childPoint = [self convertPoint:point toView:childView];
+        
+        // 又继续交给每一个subview去hitTest
+        UIView *fitView = [childView hitTest:childPoint withEvent:event];
+        
+        // 如果childView的subviews存在能够处理事件的，就返回当前遍历的childView对象作为事件处理对象
+        if (fitView) {
+            return fitView;
+        }
+    }
+    
+    //4. 没有找到比自己更合适的view
+    return self;
+}
+```
+
+可以看到这个`hitTest:withEvent:`函数实现，主要就是测试这个UIView对象，到底能不能够处理这个UI触摸事件。
+
+结束`hitTest:withEvent:`的条件:
+
+- (1) `self.userInteractionEnabled == NO || self.hidden == YES || self.alpha <= 0.01`
+- (2) `![self pointInside:point withEvent:event]`
+
+执行`hitTest:`的层次顺序如下:
+
+```
+- UIApplication
+	- UIWindow
+		- RootView
+			- Subviews[n-1]
+			- Subviews[n-2] 
+			- ....
+			- Subviews[0]
+```
+
+## 使用Category Associate 扩大UI的事件响应区域
+
+```objc
+#import <UIKit/UIKit.h>
+
+@interface UIButton (EnlargeTouchArea)
+
+/**
+ *  设置按钮上下左右的扩展响应区域
+ */
+- (void)setEnlargeEdgeWithTop:(CGFloat)top
+                        right:(CGFloat)right
+                       bottom:(CGFloat)bottom
+                         left:(CGFloat)left;
+
+@end
+```
+
+```
+#import "UIButton+EnlargeTouchArea.h"
+#import <objc/runtime.h>
+
+static void *kButtonUpKey = &kButtonUpKey;
+static void *kButtonLeftKey = &kButtonLeftKey;
+static void *kButtonDownKey = &kButtonDownKey;
+static void *kButtonRightKey = &kButtonRightKey;
+
+@implementation UIButton (EnlargeTouchArea)
+
+- (void)setEnlargeEdgeWithTop:(CGFloat)top right:(CGFloat)right bottom:(CGFloat)bottom left:(CGFloat)left
+{
+    objc_setAssociatedObject(self, kButtonUpKey, @(top), OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(self, kButtonLeftKey, @(left), OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(self, kButtonDownKey, @(bottom), OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(self, kButtonRightKey, @(right), OBJC_ASSOCIATION_ASSIGN);
+}
+
+- (CGRect) enlargedRect
+{
+    NSNumber* topEdge = objc_getAssociatedObject(self, &kButtonUpKey);
+    NSNumber* rightEdge = objc_getAssociatedObject(self, &kButtonRightKey);
+    NSNumber* bottomEdge = objc_getAssociatedObject(self, &kButtonDownKey);
+    NSNumber* leftEdge = objc_getAssociatedObject(self, &kButtonLeftKey);
+    
+    if (topEdge && rightEdge && bottomEdge && leftEdge)
+    {
+        // 上下左右分别扩大响应区域
+        return CGRectMake(
+                          self.bounds.origin.x - leftEdge.floatValue,
+                          self.bounds.origin.y - topEdge.floatValue,
+                          self.bounds.size.width + leftEdge.floatValue + rightEdge.floatValue,
+                          self.bounds.size.height + topEdge.floatValue + bottomEdge.floatValue
+                          );
+    } else {
+        return self.bounds;
+    }
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    
+    // 扩大后的响应区域
+    CGRect rect = [self enlargedRect];
+    
+    // 如果扩大的响应区域 == 当前自身的响应区域，直接执行父类的事件处理
+    if (CGRectEqualToRect(rect, self.bounds))
+    {
+        return [super hitTest:point withEvent:event];
+    }
+    
+    // 扩大的响应区域 > 当前自身的响应区域
+    return CGRectContainsPoint(rect, point) ? self : nil;
+}
+
+@end
+```
+
+## 位移枚举 + Mask掩码
+
+这种枚举适用于一个统一的枚举类型来定义，具备:
+
+- (1) 多种情况
+- (2) 每一种情况，又分为其他的小情况
+
+一个简单的demo
+
+
+```objc
+typedef NS_OPTIONS(NSInteger, PersonState) {
+	
+	// 第一种类型: 占用1~8位的二进制位，掩码是 1111,1111
+    PersonStateMask                     = 0xFF,//1-8位的掩码（十六进制数，一个数代表4位，F:1111，0:0000）
+    PersonStateUnknown                  = 0,
+    PersonStateAlive                    = 1,
+    PersonStateWork                     = 2,
+    PersonStateDead                     = 3,
+
+	// 第二种类型: 占用9~16位的二进制位，掩码是 1111,1111,0000,0000   
+    HouseStateMask                      = 0xFF00,//9-16位，左移8位
+    HouseStateNone                      = 1 << 8,
+    HouseStateSmall                     = 1 << 9,
+    HouseStateBig                       = 1 << 10,
+    
+	// 第三种类型: 占用17~24位的二进制位，掩码是 1111,1111,0000,0000,0000,0000   
+    CarStateMask                        = 0xFF0000,//17-24位，左移16位
+    CarStateNone                        = 1 << 16,
+    CarStateSmall                       = 1 << 17,
+    CarStateBig                         = 1 << 18,
+};
+```
+
+如下就是分别获取得到 1~8位、9~16位、17~24位 这三个区段的所谓的Mask掩码
+
+```c
+0xFF		>>> 1111,1111 >>> 获取低8位值
+0xFF00 		>>> 1111,1111,0000,0000 >>> 获取9-16位值
+0xFF0000  	>>> 1111,1111,0000,0000,0000,0000 >>> 获取17-24位值
+```
+
+使用当前的枚举混合值，通过与Mask掩码，进行`按位与`获取Mask掩码对应长度的值:
+
+```c
+(1) & 上 `FF` 获取低8位的值
+(2) & 上 `FF00` 获取第9位到16位的值
+(3) & 上 `FF0000` 获取第17位到24位的值
+```
+
+示例代码
+
+```c
+//1.
+PersonState state = PersonStateUnknown;
+
+//2.
+state = PersonStateDead;
+
+//3.
+state = state | HouseStateBig;
+NSLog(@"state = %ld", state);
+NSLog(@"person state = %ld", state & PersonStateMask);
+NSLog(@"house state = %ld", state & HouseStateMask);
+
+//4.
+state = state | CarStateBig;
+
+//5. 
+NSLog(@"state = %ld", state);
+NSLog(@"person state = %ld", state & PersonStateMask);
+NSLog(@"house state = %ld", state & HouseStateMask);
+NSLog(@"car state = %ld", state & CarStateMask);
+```
+
+## `-[NSObject class]`、`+[NSObject class]`、`objc_getClass(<#const char *name#>)`的区别
+
+### `-[NSObject class]`源码实现
+
+```c
+- (Class) class
+{
+  return object_getClass(self);
+}
+```
+
+### `+[NSObject class]`源码实现
+
+```c
++ (Class) class
+{
+  return self;
+}
+```
+
+### `objc_getClass(<#const char *name#>)`源码实现
+
+```c
+Class object_getClass(id obj)
+{
+    if (obj) return obj->getIsa();//读取的是isa指针，所指向的objc_class实例
+    else return Nil;
+}
+```
+
+所以对于如下两种使用`object_getClass(obj)`得到的Class是不同的:
+
+```
+1. Class cls1 = object_getClass([Person new]);
+2. Class cls1 = object_getClass([Person class]);
+```
+
+前者是MetaClass，或者是Class。
+
+## Cache缓存数据、在多线程环境下使用的代码模板
+
+```objc
+@interface ClassMapper : NSObject
+@end
+
+@implementation ClassMapper
++ (instancetype)mapperWithClass:(Class)cls {
+    if (Nil == cls) {return nil;}
+    
+    /**
+     *  1. 单例模板控制缓存正确初始化、信号值为1的信号量初始化
+     */
+    static CFMutableDictionaryRef       _cache = NULL;
+    static dispatch_semaphore_t         _semephore = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _cache = CFDictionaryCreateMutable(kCFAllocatorDefault, 32, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        _semephore = dispatch_semaphore_create(1);
+    });
+    
+    /**
+     *  2. 先查询缓存
+     */
+    const void *clsName =  (__bridge const void *)(NSStringFromClass(cls));
+    dispatch_semaphore_wait(_semephore, DISPATCH_TIME_FOREVER);
+    ClassMapper *clsMapper = CFDictionaryGetValue(_cache, clsName);
+    dispatch_semaphore_signal(_semephore);
+    
+    /**
+     *  3. 如果有缓存就直接返回，如果没有缓存则创建新的对象并完成缓存
+     */
+    if (!clsMapper) {
+        clsMapper = [ClassMapper new];
+        
+        dispatch_semaphore_wait(_semephore, DISPATCH_TIME_FOREVER);
+        CFDictionarySetValue(_cache, clsName, (__bridge const void *)(clsMapper));
+        dispatch_semaphore_signal(_semephore);
+
+    }
+
+    return clsMapper;;
+}
+@end
+```
+
+## Category不会`覆盖`原始方法实现，以及多个Category重写相同的方法实现的调用顺序
+
+### 主要涉及的问题
+
+```
+1. Category是否会覆盖原始Class中的Method？
+2. 多个Category添加相同的Method，调用顺序是什么？
+```
+
+### 一、Category中重写原始类中已经存在的方法实现时
+
+- (1) Category中重写的Method，肯定会排在原始类的Method的`最前面`
+
+- (2) 每当从编译路径中读取到Category重写的Method，就会将这个重写的Method采用`头插法`插入到原始类的`method_list`的`第一个`位置
+
+也就是说，越在后面编译的Category中重写的Method，却会出现在`method_list`的第一个位置
+	
+### 二、多个Category中，都重写了相同的方法实现时
+
+会按照Category在编译路径中的顺序，将Method依次`头插`到原始类的`method_list`单链表中。
+
+所以，也就是Category出现的越晚，重写的Method就会出现在第一个位置。
+
+具体测试，搜索`Category覆盖原始类中的方法实现存在的问题.md`。
+
+## 触发CPU与GPU的离屏渲染的场景
+
+### CPU触发离屏渲染
+
+- (1) 使用`CoreGraphics`库函数进行绘制图像
+
+- (2) 重写`-[UIView drawRect]`方法实现中写的任何绘制代码
+    - 甚至是`空方法实现`也会触发
+
+### GPU触发离屏渲染
+
+- (1) CALayer对象设置 shouldRasterize（光栅化）
+
+- (2) CALayer对象设置 masks（遮罩）
+
+- (3) CALayer对象设置 shadows（阴影）
+
+- (4) CALayer对象设置 group opacity（不透明）
+
+- (5) 所有`文字`的绘制（UILabel、UITextView...），包括`CoreText`绘制文字、`TextKit`绘制文字
+
+
+尽量避免GPU离屏渲染，但是为了能够异步进行绘制，也有可能操作CPU离屏渲染。
+
+## 最好不要重写`-[UIView drawRect:]`来完成文本、图形的绘制，而是使用`专用图层`来专门完成绘制
+
+### 首先清楚，CPU与GPU的强项与弱势：
+
+- (1) CPU、对数据的计算处理相当快，但是对于图像的渲染很差
+- (2) GPU、有很多核心来同时做图像的渲染，所以很快。但是对于数据的计算处理，是很慢的
+
+
+所以，一定要充分利用GPU与CPU的强项：
+
+```
+CPU >>> 大量进行数据计算，少进行图像渲染
+GPU >>> 大量进行图像渲染，少进行数据计算
+```
+
+- (1) `OpenGL`绘制图像，会交给`GPU`完成渲染
+- (2) `CoreGraphics`绘制图像，会交给`CPU`完成渲染
+
+所以，最好让CPU只做一些`数据计算`，而CPU只会`图像渲染`，这样整体性能会提升很多。
+
+### 为什么不要重写`drawRect:` 
+
+- (1) 只要重写`drawRect:`，就会给layer创建一个`空的宿主图像`而浪费内存
+
+- (2) `CoreGraphics`的图像绘制，会触发`CPU的离屏渲染`，而CPU的`图像渲染`能力是很差的，会影响CPU的执行效率
+
+- (3) `专用图层`把图像渲染代码使用OpenGL操作`GPU`来完成图像的渲染，内存优化
+
+下面是使用专用图层来绘制自定义路径的代码模板，`代替`使用重写`drawRect:`
+
+```objc
+@implementation XingNengVC {
+    UIView  *_bottomView;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    
+    //1. 创建UIView容器
+    _bottomView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 200)];
+    [self.view addSubview:_bottomView];
+    
+    //2. 创建具体绘制图像的专用图层
+    CAShapeLayer *layer = [CAShapeLayer layer];
+    layer.frame = _bottomView.bounds;
+    
+    //3. 设置要绘制的图像路径
+    UIBezierPath *path = [[UIBezierPath alloc] init];
+    [path moveToPoint:CGPointMake(175, 100)];
+    [path addArcWithCenter:CGPointMake(150, 100) radius:25 startAngle:0 endAngle:2*M_PI clockwise:YES];
+    [path moveToPoint:CGPointMake(150, 125)];
+    [path addLineToPoint:CGPointMake(150, 175)];
+    [path addLineToPoint:CGPointMake(125, 225)];
+    [path moveToPoint:CGPointMake(150, 175)];
+    [path addLineToPoint:CGPointMake(175, 225)];
+    [path moveToPoint:CGPointMake(100, 150)];
+    [path addLineToPoint:CGPointMake(200, 150)];
+    
+    //4. 将要绘制的路径设置给layer
+    layer.path = path.CGPath;
+    
+    //3.
+    [_bottomView.layer addSublayer:layer];
+}
+
+@end
+```
+
+## objc对象的`释放`与`废弃`，是两个`不同的阶段`
+### 释放
+
+应该是释放对象的`持有`，即对objc对象发送`retain\release\autorelase`等消息，修改objc对象的`retainCount`值，但是对象的内存一直都还存在。
+
+释放持有的操作，是`同步`的。
+
+### 废弃
+
+当某个`空闲`时间，系统才会将内存的数据全部擦除干净，然后将这块内存`合并为系统未使用的内存`中。而此时如果程序继续访问该内存块，就会造成程序崩溃。
+
+内存的彻底`废弃`操作，是`异步`的，也就是说有一定的`延迟`。
+
+
+### 执行了`-[NSObject dealloc]`，并不是说对象所在内存就被`废弃`了。只是对于常理来说，这个对象已经`标记`为即将废弃，程序中也不要再继续使用了。
+
+
+```objc
+- (void)testMRC {
+
+    _mrc = [[MRCTest alloc] init];
+    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
+    
+    MRCTest *tmp1 = [_mrc retain];
+    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
+    
+    [_mrc release];
+    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
+    
+    [tmp1 release];
+    NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);
+    
+    //【重要】尝试多次输出retainCount
+    for (NSInteger i = 0; i < 10; i++) {
+        NSLog(@"[_mrc retainCount] = %lu", [_mrc retainCount]);//【重要】循环执行几次之后，崩溃到此行
+    }
+}
+```
+
+运行之后，结果崩溃到for循环中的第二次或第三次循环，`程序崩溃`报错如下:
+
+```
+thread 1:EXC_BAD_ACCESS .... 
+```
+
+释放掉对象之后，指向该对象的指针，仍然会保留在局部方法块的所在栈中，仍然是可以在短暂的时间内继续通过指针访问到对象。但是超过一定时间后，对象才会被彻底废弃掉，这个时候如果还去使用这个指针就会造成程序崩溃。
+
+那这样是说最终对象的内存废弃过程，是一个`异步`执行的吗？或者说有一定的`延迟时间`吗？
+
+是`延迟`的，因为最终对象内存会被擦除掉，并与系统内存合并到一起，所以这个过程确实是一个异步的。	
 
 ## objc对象弱引用实现
 
@@ -1767,7 +2284,7 @@ dispatch_queue_set_specific(queue, kNetworkCacheMetaDispatchQueueSpecificKey, (v
 }
 ```
 
-## 借助`NSProxy`实现动态代理，以及`消息转发阶段1`机制来模拟`多继承`
+## 使用`消息转发阶段1`机制，来模拟`多继承`
 
 ### 有三个抽象接口
 
@@ -1872,11 +2389,6 @@ dispatch_queue_set_specific(queue, kNetworkCacheMetaDispatchQueueSpecificKey, (v
 
 @end
 ```
-
-最近看NSProxy已经注释掉了`forwardingTargetForSelector:`，所以可以通过:
-
-- (1) `methodSignatureForSelector:` + `forwardInvocation:`
-- (2) 继承自NSObject完成`forwardingTargetForSelector:`
 
 ## type encodings 数据类型的系统存放的字符值
 
@@ -2026,36 +2538,6 @@ static const char XZHIvarTypeCBitFields = _C_BFLD;//b
 @end
 ```
 
-## 几种获取Class的系统方法实现源码
-
-### `-[NSObject class]`
-
-```objc
-- (Class) class
-{
-  return object_getClass(self);
-}
-```
-
-### `+[NSObject class]`
-
-```objc
-+ (Class) class
-{
-  return self;
-}
-```
-
-### `object_getClass(id obj)`
-
-```c
-Class object_getClass(id obj)
-{
-    if (obj) return obj->getIsa();
-    else return Nil;
-}
-```
-
 ## NSAarray与NSMuatbleArray在alloc、init时的类型是不同的
 
 > NSArray、NSMutableArray中的类簇应用.md
@@ -2182,28 +2664,33 @@ static __NSPlacehodlerArray *GetPlaceholderForNSMutableArray() {
 - (3) NSArray的alloc方法实现
 
 ```objc
+@implementation NSArray
 + (id)alloc
 {
     if (self == [NSArray class]) {
         return GetPlaceholderForNSArray();//获取单例A
     }
 }
+@end
 ```
 
 - (4) NSMutableArray的alloc方法实现
 
 ```objc
+@implementation NSMutableArray
 + (id)alloc
 {
     if (self == [NSMutableArray class]) {
         return GetPlaceholderForNSMutableArray();//获取单例B
     }
 }
+@end
 ```
 
 - (5) `-[__NSPlacehodlerArray init]`方法实现
 
 ```objc
+@implementation __NSPlacehodlerArray
 - (id)init
 {	
     if (self == GetPlaceholderForNSArray()) {//单例A
@@ -2220,6 +2707,7 @@ static __NSPlacehodlerArray *GetPlaceholderForNSMutableArray() {
     }
     return self;
 }
+@end
 ```
 
 
@@ -2491,12 +2979,8 @@ YYModel.h中的写法
 	//5. 将Image绘制到路径中
   	[self drawInRect:circleRect];
   
-	//6. 路径边界样式
-#if StrokeRoundedImages
-  	circle.lineWidth = 1;
-	[[UIColor darkGrayColor] set];
+	//6. 路径绘制
 	[circle stroke];
-#endif
   
   	//7. 从画布中获取渲染得到的图像
 	UIImage *roundedImage = UIGraphicsGetImageFromCurrentImageContext();
@@ -2548,7 +3032,7 @@ YYModel.h中的写法
 
 - (1) 使用 `concurrent queue` 并发队列
 - (2) 对于`读取` >>> `dispatch async`
-- (3) 对于`写` >>> ``dispatch barrier async`
+- (3) 对于`写` >>> `dispatch barrier async`
 
 ### 代码模板
 
@@ -2576,6 +3060,7 @@ dispatch_async(concurrentDiapatchQueue, ^{NSLog(@"10 - thread: %@", [NSThread cu
 ```
 
 <img src="./gcd5.jpg" alt="" title="" width="700"/>
+
 
 ## 使用`dispatch_semephore_t`来让一段异步代码强制性的同步执行
 

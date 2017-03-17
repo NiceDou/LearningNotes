@@ -105,7 +105,7 @@ int main(int argc, const char * argv[]) {
 你可以按如下命令来生成sshkey
 
 ```
-ssh-keygen -t rsa -C "xxxxx@xxxxx.com"
+ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
 ```
 
 2.查看你的public key
@@ -114,15 +114,19 @@ ssh-keygen -t rsa -C "xxxxx@xxxxx.com"
 cat ~/.ssh/id_rsa.pub
 ```
 
-3.添加后，在终端（Terminal）中输入
+3.Start the ssh-agent in the background.
 
 ```
-ssh -T git@git.oschina.net
+eval "$(ssh-agent -s)"
 ```
 
-若返回
-Welcome to Git@OSC, yourname!
+4.Add your SSH key to the ssh-agent
 
+```
+ssh-add -K ~/.ssh/id_rsa
+```
+
+5.把`id_rsa.pub`文件中的数据添加到github的SSHKey的设置中
 
 ## 响应码大致分类
 
