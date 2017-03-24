@@ -757,7 +757,7 @@ struct __CFRunLoop {
 全局缓存dic ---> runloop ---> thread
 ```
 
-## 证实、只要thread开启runloop，那么thread就不会被废弃:
+## 证实、只要thread成功开启runloop（需要添加source），那么thread就不会被废弃
 
 ```objc
 @implementation ViewController

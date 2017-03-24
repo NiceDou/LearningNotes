@@ -3,6 +3,39 @@
 
 因为App启动时，会等待所有objc类的load方法实现全部执行完，才会走后面的代码逻辑。
 
+## objc中的几种for循环性能比较
+
+http://www.open-open.com/lib/view/open1488680807266.html
+
+主要有如下几种for循环
+
+```c
+for (int i = 0; i < 100; i++) {...}
+```
+
+```c
+for (id obj in objs) {....}
+```
+
+```c
+[array enumerateObjectsUsingBlock:^(id  _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+	....
+}];
+```
+
+```c
+// 通过block回调，在子线程中遍历，对象的回调次序是乱序的,而且调用线程会等待该遍历过程完成
+[array enumerateObjectsWithOptions:NSEnumerationConcurrent usingBlock:^(id  _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+	....
+}];
+```
+
+可以得到如下结论:
+
+- (1) 通常情况下，`for-in`是最快的，因为使用了快速枚举
+
+- (2) `NSEnumerationConcurrent+Block`形式的遍历，会将每一次的遍历任务，都会分配到一个线程上单独执行，只适用于单次遍历任务比较耗时的代码，如果对于普通的轻量级遍历，则反而会显得效率很低
+
 ## 主线程上常见比较耗时的代码类型:
 
 - (1) 各种NSObject对象的创建与废弃
@@ -23,9 +56,111 @@
 
 尽量的将如上步骤，全部放到子线程异步执行。
 
-## 异步子线程进行图像解压缩、渲染、圆角处理
+## 从创建各种UIView，到对UIView设置各种显示的数据，到最终屏幕上显示的过程
 
-简单的demo:
+### 一、CPU处理部分
+
+- (1) UIView对象的创建，以及内部的CALayer对象创建，以及其他辅助对象的创建
+
+- (2) 读取并触发图片文件的解压缩，读取文本数据
+
+- (3) 将设置给UIView对象的 图像、文本、背景色、字体... 全部设置给CALayer
+
+- (4) 文本尺寸计算，frame计算，调整UIView对象的frame，实际上就是调整CALayer的各种属性值
+
+- (5) 将对CALayer每一个属性值修改，需要完成的重绘操作，打包成一个`CATransaction`
+
+- (6) 或者是重写`-[CALayer drawLayer:inContext:] 或 -[UIView drawRect:]`完成的每一个自定义绘制，打包成一个`CATransaction`
+
+- (7) 在RunLoop处于最清闲的时刻，将一个个的`CATransaction`重绘操作，发送给RenderServer进行`渲染`
+
+到此，就开始到下面第二个处理部分，GPU的渲染。
+
+### 二、GPU处理部分	
+
+- (1) 取出一个个`CATransaction`中的哪一个CALayer、哪一个属性值，进行屏幕绘制
+
+- (2) 如果添加了`CAAnimation`动画，则根据动画执行过程，使用`OpenGL`进行计算、进行渲染成为一帧一帧的`bitmap位图`
+
+- (3) 对设置的图片进行`解码`，渲染成为`bitmap位图`
+
+- (4) 对设置的文本进行渲染，同样渲染成为`bitmap位图`
+
+- (5) 对多个`bitmap位图`进行混合处理
+
+- (6) 并对多个层级关系的CALayer各自渲染得到的`bitmap位图`，进行混合处理
+
+- (7) 将最终混合完毕得到的`bitmap位图`，继续渲染为显示器硬件能识别的`纹理`格式，并存入到帧缓冲池中
+
+- (8) 通知显示器硬件去帧缓冲池，读取镇数据，进行屏幕的绘制
+
+### 三、屏幕重绘操作部分 
+
+- (1) 显示器从镇缓存池中，取出当前帧要显示的帧数据
+- (2) 将帧数据显示到显示器硬件上
+
+### 能够做的优化
+
+- (1) 将第一部分，除开UIKit对象之外，全部放到子线程异步完成，并且能够缓存就缓存
+
+- (2) 尽量将第二部分的CALayer数据的渲染，提前在子线程异步完成，也就是尽量直接进入第二部分的`(7)`步
+
+## UI性能、使用 `[CALayer renderInContext:]` 将CALayer在子线程完成渲染并得到Image，然后直接塞给`CALayer.contents`显示
+
+eg、把整个屏幕转化为图片
+
+```objc
+//1. 
+UIImageView* imageV = [[UIImageView alloc]initWithFrame:CGRectMake(0, 0, self.view.frame.size.width, self.view.frame.size.height)];
+
+//2.
+UIGraphicsBeginImageContextWithOptions(imageV.frame.size, NO, 0);
+
+//3.
+CGContextRef context = UIGraphicsGetCurrentContext();
+
+//4. 把当前的整个画面导入到context中，然后通过context输出UIImage，这样就可以把整个屏幕转化为图片
+[self.view.layer renderInContext:context];
+
+//5.
+UIImage* image = UIGraphicsGetImageFromCurrentImageContext();
+
+//6.
+imageV.image = image;
+
+//7. 
+UIGraphicsEndImageContext();
+```
+
+可以将上述的代码，全部放到子线程进行优化。
+
+## UI性能、异步子线程进行图像的：解压缩、解码、渲染、圆角 等处理
+
+### 通常读取PNG/JPEG等文件都是压缩图片文件，需要首先进行解压缩，然后进行解码，最终才能作为绘制渲染的图像
+
+- (1) 解码后的图像会比较`大`，通常不会缓存到磁盘文件，只会内存中缓存
+
+- (2) SDWebImage的做法是把`解码`操作从主线程移到`子线程`，让耗时的解码操作不占用主线程的时间
+
+
+### 触发图片解码的情况
+
+- (1) `+[UIImage imageNamed:]`  加载到原图后立刻进行解码，仍然会保留原始图像
+
+- (2) `+[UIImage imageWithContentsOfFile:]`  图像渲染前进行解码，不会保存原始图像
+
+- (3) 即将对图像进行绘制，立刻也会触发解码
+
+对解码的优化，就是尽量的在子线程完成。并且可以是ImageIO来进行图像解码的优化：
+
+- (1) 开启一个子线程来完成下面所有的任务
+
+- (2) 指定`kCGImageSourceShouldCacheImmediately`参数来读取压缩图片
+
+- (3) `kCGImageSourceShouldCacheImmediately` 决定是否会在加载完后立刻开始解码，并且还会将解码后的图像缓存起来
+
+
+### 在子线程上，进行图像绘制的时刻，触发图像的解码
 
 ```objc
 @implementation UIImageHelper
@@ -35,15 +170,15 @@
 //    XZHDispatchQueueAsyncBlockWithQOSBackgroud(^{
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         
-        //1.
+        //1. 仅仅只是读取和解压缩图像文件，并没有进行图像的【解码】
         NSString *filepath = [[NSBundle mainBundle] pathForResource:name ofType:type];
         UIImage *image = [UIImage imageWithContentsOfFile:filepath];
         
-        //2.
+        //2. 创建绘图上下文
         UIGraphicsBeginImageContextWithOptions(image.size, NO, [UIScreen mainScreen].scale);
         CGContextRef context = UIGraphicsGetCurrentContext();
         
-        //3.
+        //3. 绘图区域
         CGRect rect = CGRectMake(0, 0, image.size.width, image.size.height);
         
         //4. 圆角路径切割画布成为圆角的区域画布
@@ -54,7 +189,7 @@
         CGContextAddPath(context, path);
         CGContextClip(context);
         
-        //5. 再将图像绘制到圆形区域画布中
+        //5. 【重要】当绘制图像时，一定会触发图像的【解码】
         [image drawInRect:rect];
         
         //6.
@@ -71,7 +206,10 @@
 @end
 ```
 
-参考自AFImageDownloader的demo:
+### 在子线程上，使用ImageIO读取图片文件，并使用`kCGImageSourceShouldCacheImmediately`设置项，来让读取图片解压缩之后，并立刻开始图像的`解码`，并由ImageIO自己将解码后的图像在内存中缓存起来
+
+参考自AFImageDownloader的部分代码
+
 
 ```objc
 @implementation UIImageHelper
@@ -79,17 +217,18 @@
 - (void)decompressImageNamed2:(NSString *)name ofType:(NSString *)type completion:(void (^)(UIImage *image))block {
     XZHDispatchQueueAsyncBlockWithQOSBackgroud(^{
     
-        //1. 使用ImageIO读取文件，会缓存图像
+        //1. 设置使用ImageIo读取图片文件时，直接解压缩、解码图像文件，
         NSDictionary *dict = @{
-                               // 指定缓存解压后的图像
                                (id)kCGImageSourceShouldCache : @(YES)
                                };
+		
+		//2. 使用ImageIO读取文件
         NSString *filepath = [[NSBundle mainBundle] pathForResource:name ofType:type];
         NSURL *url = [NSURL fileURLWithPath:filepath];
         CGImageSourceRef source = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
         CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, (CFDictionaryRef)dict);
         
-        //2. Create a bitmap context of a suitable size to draw to, forcing decode
+        //3. Create a bitmap context of a suitable size to draw to, forcing decode
         size_t width = CGImageGetWidth(cgImage);//图片的真实宽度
         size_t height = CGImageGetHeight(cgImage);//图片的真实高度
         size_t bytesPerRow = roundUp(width * 4, 16);
@@ -102,26 +241,26 @@
             return;
         }
         
-        //3. Create the colour space and an image buffer
+        //4. Create the colour space and an image buffer
         void *imageBuffer = malloc(byteCount);
         CGColorSpaceRef colourSpace = CGColorSpaceCreateDeviceRGB();
         
-        //4. Create the image context and release the colour space.
+        //5. Create the image context and release the colour space.
         CGContextRef imageContext = CGBitmapContextCreate(imageBuffer, width, height, 8, bytesPerRow, colourSpace, kCGImageAlphaPremultipliedLast);
         CGColorSpaceRelease(colourSpace);
         
-        //5. Draw the image to the context and release it.
+        //6. Draw the image to the context and release it.
         CGContextDrawImage(imageContext, CGRectMake(0, 0, width, height), cgImage);
         CGImageRelease(cgImage);
         
-        //6. Now get an image ref from the context.
+        //7. Now get an image ref from the context.
         CGImageRef outputImage = CGBitmapContextCreateImage(imageContext);
         
-        //7. Clean up memory allocated by the colour space and image buffer.
+        //8. Clean up memory allocated by the colour space and image buffer.
         CGContextRelease(imageContext);
         free(imageBuffer);
         
-        //8. callback outputImage converted UIImage
+        //9. callback outputImage converted UIImage
         dispatch_async(dispatch_get_main_queue(), ^{
             UIImage *image = [UIImage imageWithCGImage:outputImage];
             block(image);
@@ -138,7 +277,7 @@
 ### 总结在子线程提前对一些PNG、JPEG等压缩格式的图文文件进行渲染时几个步骤:
 
 - (1) 先让流程在一个后台子线程上完成
-- (2) 使用ImageIO读取压缩格式图片文件，进行解压缩，并缓存起来
+- (2) 使用`ImageIO`读取压缩格式图片文件，进行`解压缩`，并`缓存`起来
 - (3) 开起一个绘图上下文
 - (4) 圆角`CGPathRef`创建，clip剪裁，添加到绘图上下文
 - (5) 将解压缩后的图像，在绘图上下文中进行绘制
@@ -147,6 +286,45 @@
 - (8) 将`CGImageRef`实例，设置给`UIView.layer.contents`属性值进行显示
 
 还可以更近异步，将处理后最终的图像，在内存中缓存起来。
+
+## UI性能、网络超大高清图像的加载优化
+
+### 方案一、分多次从web拉取不同规格的图像进行覆盖显示
+
+- (1) 依次从web上加载不同尺寸的图片，从小到大
+- (2) 最开始先拉取一个小尺寸的缩略图做拉伸显示
+- (3) 然后拉取中等规格的图，拉取完毕直接覆盖显示
+- (4) 最后拉取原图，拉取完成后显示原图
+
+缺点、需要分很多次的网络请求。
+
+### 方案二、直接从web拉取原始图像，以渐进式的方式一点一点的加载
+
+- (1) 直接从web拉取原始的比较大、高清的图像，一次性肯定拉取不完
+- (2) 没当接收到web传递过来的一部分图像数据，就显示一部分
+- (3) 一个很大、很高清的图像文件，就是一点一点的加载出来
+
+缺点、只有一次请求，但是需要等待很长时间，才能完整的加载出一个图像。
+
+### 方法三、结合使用方案一与方案二
+
+- (1) 先拉取一个小尺寸缩略图做拉伸显示（第一次请求）
+- (2) 然后采用方案二，直接拉取原始大图、高清图（第二次请求），并使用渐进式的方式加载部分图像
+
+
+这种方案结合了前面两种方案各自的优势，既减少了方案一的请求数，又利用了方案二的渐进式图像文件数据的加载。
+
+渐进式的图像文件数据加载的主要步骤:
+
+- (1) 创建一个空的渐进式ImageSource >>> `CGImageSourceCreateIncremental(NULL);`
+- (2) 不断的拼接部分图片数据NSData
+- (3) 使用当前得到的部分数据NSData，更新渐进式ImageSource
+- (4) 从渐进式ImageSource中获取渲染得到CGImageRef，即可用于显示
+- (5) 加载完毕，释放废弃掉渐进式ImageSource
+
+### 关于大图的加载，可以使用CATiledLayer图层进行切割分区域显示
+
+..
 
 ## YYMemoryCache中在子线程释放废弃对象的`三部曲`
 
@@ -636,7 +814,7 @@ void PersonLog(id target, SEL sel, NSString *name) {
 2017-03-06 18:52:58.338 Demo[21770:326695] IMP PersonLog: name = hahahahaha
 ```
 
-## `读写 Ivar > 发送 getter/setter 消息 > KVC`
+## `读写Ivar > 发送getter/setter消息 > KVC`
 
 Key-Value Coding 使用起来非常方便，但性能上要差于直接调用 Getter/Setter，所以如果能避免 KVC 而用 Getter/Setter 代替，性能会有较大提升。
 
@@ -715,6 +893,51 @@ NSInteger age = ((NSInteger (*)(id, Ivar))object_getIvar)(dog, ivar3);
 ```
 
 强制转换`object_getIvar()`的函数返回值类型，来取消对返回值默认当做objc对象。
+
+> 操作Ivar 快于 getter/setter消息传递。这个是有前提的，如果只是一次操作，肯定Ivar会更快。但是如果有很多次的调用，那么直接操作Ivar就会比发送getter/setter消息慢。因为objc的消息发送会有内存缓存的，做了一些优化的。
+
+
+```objc
+- (void)testKVC4 {
+    
+    Dog *dog = [Dog new];
+    dog.name = @"name1111";
+    dog.uid = 1111;
+    dog.age = 19;
+    dog.url = [NSURL URLWithString:@"www.baidu.com"];
+    
+    int count = 1000000;
+    double date_s = CFAbsoluteTimeGetCurrent();
+    for (int i = 0; i < count; i++) {
+        
+        NSString *name = [NSString stringWithFormat:@"name_%d", i];
+        
+        //1. stters messgae
+        dog.name = name;
+        
+        //2. Ivar
+        Ivar ivar = class_getInstanceVariable([dog class], "_name");
+        object_setIvar(dog, ivar, name);
+    }
+    double date_current = CFAbsoluteTimeGetCurrent() - date_s;
+    NSLog(@"consumeTime: %f μs",date_current * 11000 * 1000);
+}
+```
+
+使用发送getter/setter消息，消耗的时间:
+
+```
+consumeTime: 10366509.914398 μs
+```
+
+使用Ivar，消耗的时间:
+
+```
+consumeTime: 12702172.517776 μs
+```
+
+明显慢了很多去了，所以如果在多次调用时，还是使用`发送getter/setter消息`是最快的。
+
 
 ## 对 `NSArray/NSSet/NSDictionary` 容器对象进行遍历的时候，转为CoreFoundation容器对象，再进行遍历，效率会更高。这也是struct作为Context的一个应用场景。
 
@@ -911,7 +1134,9 @@ struct __touchDelegate {
 
 后后面只需要根据位段结构体实例的对应成员变量值是0还是1，就可以判断是否实现了协议方法。
 
-## struct实例，持有`Foundation对象`。当struct实例废弃时，让Foundation对象在子线程上异步释放废弃
+## `__bridge`、`__bridge_retained`、`__bridge_transfer`
+
+让struct实例，持有`Foundation对象`。当struct实例废弃时，让Foundation对象在子线程上异步释放废弃
 
 ### 核心主要牵涉三个用于`c实例`与`objc对象`进行转换的东西
 
@@ -1067,265 +1292,17 @@ static DogsContext *_dogsCtx = NULL;
 }  
 ```
 
-## 在自定义线程上使用释放池
+## 深拷贝、浅拷贝、可变、不可变
 
-```objc
-+ (NSThread *)networkRequestThread {
-	static NSThread *_networkRequestThread = nil;
-	static dispatch_once_t oncePredicate;
-	dispatch_once(&oncePredicate, ^{
-	    
-		//1. 创建单例NSThread对象
-		_networkRequestThread = [[NSThread alloc] initWithTarget:self selector:@selector(networkRequestThreadEntryPoint:) object:nil];
-		
-		//2. 开启线程对象
-		[_networkRequestThread start];
-	});
+### 深拷贝、浅拷贝 的区别与联系
 
-	return _networkRequestThread;
-}
+<img src="./深浅拷贝3.png" alt="" title="" width="700"/>
 
-///NSThread入口函数
-+ (void)networkRequestThreadEntryPoint:(id)__unused object {
+而一个objc对象的深拷贝，其实建立在浅拷贝的基础之上，继续对objc对象内部所有的Ivar继续执行浅拷贝（递归执行`浅拷贝`）。
 
-	// 使用释放池进行包裹
-	@autoreleasepool {
-		[[NSThread currentThread] setName:@"AFNetworking"];
-		NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
-		[runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
-		[runLoop run];
-	}
-}
-```
+### 深拷贝、浅拷贝、可变、不可变，四者之间的关系
 
-对于自己创建的`NSThread`子线程，一定要手动创建释放池。
-
-## 给线程的runloop添加2个Observer，用来给线程永远保持一个最新鲜的释放池
-
-提供NSThread分类方法创建释放池的入口
-
-```objc
-// 标记是否创建过释放池
-static NSString *const kXZHNSThreadAutoleasePoolKey      = @"XZHNSThreadAutoleasePoolKey";
-
-// 标记存储释放池数组
-static NSString *const kXZHNSThreadAutoleasePoolStackKey = @"XZHNSThreadAutoleasePoolStackKey";
-
-@implementation NSThread (XZHAddtions)
-
-+ (void)xzh_addAutoreleasePool {
-
-    //1. 主线程thread，会自己创建释放池
-    if ([NSThread isMainThread]) {return;}
-    
-    //2. 线程的字典对象
-    NSMutableDictionary *threadDic = [NSThread currentThread].threadDictionary;
-    
-    //2. 是否已经创建了释放池
-    if ([threadDic objectForKey:kXZHNSThreadAutoleasePoolKey]) {return;}
-    
-    //4. 给当前线程创建释放池
-    AutoreleasePoolSetup();
-    
-    //5. 标记当前线程已经创建了释放池
-    [threadDic setObject:kXZHNSThreadAutoleasePoolKey forKey:kXZHNSThreadAutoleasePoolKey];
-}
-
-@end
-```
-
-`AutoreleasePoolSetup()`完成给线程注册释放池，子线程的runloop添加两个observer.
-
-```c
-static void AutoreleasePoolSetup() {
-
-    //1. 给runloop添加第一个observer
-    AddRunLoopObserverForAutoreleasePoolPush();
-    
-    //2. 给runloop添加第二个observer
-    AddRunLoopObserverForAutoreleasePoolPop();
-}
-```
-
-给runloop添加第一个observer: `AddRunLoopObserverForAutoreleasePoolPush();`完成创建释放池，监听`kCFRunLoopEntry`，其oder最大，表示优先级最高
-
-```c
-static void AddRunLoopObserverForAutoreleasePoolPush() {
-    
-    /**
-     *  注意: 使用CoreFoundation版本的RunLoop的api，因为是线程安全的
-     */
-
-    //1. 获取/创建 当前线程的runloop
-    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
-    
-    //2. 创建 runloop observer，监听 `runloop进入`的状态
-    /*
-    创建runloop observer函数的参数意义:
-    CFRunLoopObserverCreate(CFAllocatorRef allocator,
-                            CFOptionFlags activities,//监听runloop的哪一个状态
-                            Boolean repeats,//重复性不断监听
-                            CFIndex order,//RunLoopObserver的优先级，当在Runloop同一运行阶段中有多个CFRunLoopObserver时，根据这个来先后调用，CFRunLoopObserver，默认值是0
-                            CFRunLoopObserverCallBack callout,//observer回调c函数
-                            CFRunLoopObserverContext *context);//用于给observer回调c函数中，传递参数的context
-     */
-    
-    /**
-     *  observer的优先级最大:
-     *  0x7FFFFFFF是一个十六进制数
-     *  转成二进制数==>0111,1111,1111,1111,1111,1111,1111,1111==>32位二进制数，第一位0，表示正数
-     *  而int类型变量占用32个二进制位，第一位是符号位（表示正负数），后面31位是数值位
-     *  所以，0x7FFFFFFF表示最大的int类型正数，也可以使用 INT_MAX 代替
-     */
-    CFIndex order = 0x7FFFFFFF;
-    CFRunLoopObserverRef pushObserver = NULL;
-    pushObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
-                                           kCFRunLoopEntry,
-                                           true,
-                                           order,
-                                           XZHCFRunLoopObserverCallBack,
-                                           NULL);
-    
-    //3. observer注册给runloop，注意runloop mode >>> commom modes
-    CFRunLoopAddObserver(runLoop, pushObserver, kCFRunLoopCommonModes);
-    
-    //4.
-    CFRelease(pushObserver);
-}
-```
-
-给runloop添加第二个observer: `AddRunLoopObserverForAutoreleasePoolPop();`完成释放释放池，监听`kCFRunLoopBeforeWaiting 与 kCFRunLoopExit`，其oder最`小`，表示优先级最`低`
-
-```c
-static void AddRunLoopObserverForAutoreleasePoolPop() {
-
-    //1.
-    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
-    
-    //2. runloop observer 优先级最低:
-    CFIndex order = -0x7FFFFFFF;
-    
-    //3. 监听runloop状态: 休眠、退出执行
-    CFRunLoopObserverRef popObserver = NULL;
-    popObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
-                                          kCFRunLoopBeforeWaiting | kCFRunLoopExit,
-                                          true,
-                                          order,
-                                          XZHCFRunLoopObserverCallBack,
-                                          NULL);
-    
-    //4.
-    CFRunLoopAddObserver(runLoop, popObserver, kCFRunLoopCommonModes);
-    
-    //5.
-    CFRelease(popObserver);
-}
-```
-
-两个observer统一走的回调函数
-
-
-```c
-static void XZHCFRunLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *context)
-{
-	// 根据当前runloop的状态进行不同的操作
-    switch (activity) {
-            
-        //状态一、runloop即将进入
-        case kCFRunLoopEntry: {
-            XZHAutoreleasePoolPush();// 直接创建新的释放池
-        }
-            break;
-            
-        //状态二、runloop即将休眠
-        case kCFRunLoopBeforeWaiting: {
-            XZHAutoreleasePoolPop();// 先废弃老的释放池
-            XZHAutoreleasePoolPush();// 再创建新的释放池
-        }
-            break;
-            
-        //状态三、runloop即将退出
-        case kCFRunLoopExit: {
-            XZHAutoreleasePoolPop();// 直接释放老的释放池
-        }
-            break;
-            
-        default:
-            break;
-    }
-}
-```
-
-从上面的逻辑可以看出，主要是三种状态：
-
-- (1) runloop即将进入，直接创建释放池
-- (2) runloop即将睡眠，先释放掉老的释放池，再重新创建一个新的释放池
-- (3) runloop即将退出，直接释放持有的释放池
-
-`XZHAutoreleasePoolPush()`  直接创建新的释放池
-
-```c
-static inline void XZHAutoreleasePoolPush() {
-    
-    //1. 读取线程对象的字典
-    NSMutableDictionary *dic =  [NSThread currentThread].threadDictionary;
-
-    //2. 获取线程对象存储的pool数组对象
-    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([dic objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
-    
-    //3. 如果pool数组不存在，则先创建数组对象，并存入到线程字典对象中
-    if (!autoreleasePools) {
-        autoreleasePools = CFArrayCreateMutable(kCFAllocatorDefault, 1, NULL);
-        [dic setObject:(__bridge id)(autoreleasePools) forKey:kXZHNSThreadAutoleasePoolStackKey];
-        CFRelease(autoreleasePools);
-    }
-    
-    //4. 创建新的pool对象，并加入到数组最后一个位置
-    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-    CFArrayAppendValue(autoreleasePools, (__bridge void*)(pool));
-}
-```
-
-`XZHAutoreleasePoolPop()`完成释放掉现在的释放池
-
-```c
-static inline void XZHAutoreleasePoolPop() {
-
-    //1. 获取线程对象存储的pool数组对象
-    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([[NSThread currentThread].threadDictionary objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
-    
-    //2. 获取最后的一个pool
-    NSAutoreleasePool *lastPool = CFArrayGetValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
-    
-    //3. 清除pool中的所有的对象
-    [lastPool drain];
-    
-    //4. 移除pool
-    CFArrayRemoveValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
-}
-```
-
-## CoreAnimation界面重绘的过程
-
-- (1) 注册关注MainRunLoop的如下状态改变，是MainRunLoop最清闲的时候
-	- `kCFRunLoopBeforeWaiting` 即将休息
-	- `kCFRunLoopExit` 即将退出
-
-- (2) 即将重绘的UIView对象、哪一个属性值（font、textColor、backgroudColor...） 被CoreAnimation打包为一个`CATransaction`对象
-	- (2.1) 指定哪一个UIView对象的CALayer
-	- (2.2) 要触发哪一个属性值（font、textColor、backgroudColor...）的重绘
-	- (2.3) `[CATransaction commit]` 提交
-
-- (3) CATransaction提交后，只是暂时保存到一个临时缓存区，类似于NSSet集合
-
-- (4) 等待MainRunLoop处于`kCFRunLoopBeforeWaiting 或 kCFRunLoopExit`状态回调时，再将上面的存放在临时缓存区中的`CATransaction对象的消息发送事件`，**注册**到MainRunLoop
-	- 只是注册到MainRunLoop，而MainRunLoop并不会立刻去处理消息发送
-	- 注册完毕，MainRunLoop休息了
-	
-- (5) 等待MainRunLoop被唤醒，开始新的一轮回时，就会处理上一轮回注册的`CATransaction对象的消息发送事件`
-
-利用了RunLoop处于最清闲的时刻，将多个重绘操作，按照RunLoop的每一个轮回，切割为多个批次进行重绘。
-
+<img src="./深浅拷贝1.jpg" alt="" title="" width="700"/>
 
 ## 对象关联时所有内存管理策略
 
@@ -2481,6 +2458,56 @@ static const char XZHIvarTypeCBitFields = _C_BFLD;//b
 
 注意，`'A'`是一个字符，`"A"`才是一个字符串。
 
+## NSMethodSignature
+
+每一个objc method最终都会编译成对应的c函数实现，其转换格式如下:
+
+<img src="./NSMethodSignature1.png" alt="" title="" width="700"/>
+
+NSMethodSignature 方法签名，正是用来打包上面的所有的types。
+
+```objc
+@interface NSMethodSignature : NSObject {
+@private
+    void *_private;
+    void *_reserved[6];
+}
+
+// 传入c函数最终的整体编码，构造一个方法签名
++ (nullable NSMethodSignature *)signatureWithObjCTypes:(const char *)types;
+
+//1. 方法的形参总数
+@property (readonly) NSUInteger numberOfArguments;
+
+//2. 获取每一个形参的数据类型
+- (const char *)getArgumentTypeAtIndex:(NSUInteger)idx NS_RETURNS_INNER_POINTER;
+
+//3. 暂时不知道是干嘛的
+@property (readonly) NSUInteger frameLength;
+
+//4. 暂时不知道是干嘛的
+- (BOOL)isOneway;
+
+//5. 方法返回值的数据类型的type encoding字符串
+@property (readonly) const char *methodReturnType NS_RETURNS_INNER_POINTER;
+
+//6. 返回值的长度。如果大于0，表示非void类型，否则就是void类型
+@property (readonly) NSUInteger methodReturnLength;
+
+@end
+```
+
+那么可以看到NSMethodSignature包含如下信息
+
+- (1) 方法有多少个参数、以及每一个参数的类型
+- (2) 方法的返回值类型
+
+完全可以描述一个最终编译生成的c函数。
+
+## jspatch 替换方法实现的逻辑
+
+<img src="./jspatch.png" alt="" title="" width="700"/>
+
 ## objc对象的等同性判断写法模板
 
 重写NSObject的实例方法
@@ -3137,3 +3164,1089 @@ OSAtomicDecrement32Barrier(); 变量自减，并使用一个栅栏来防止多�
 ```
 
 常用也就这几个了。
+
+## CoreAnimation 添加到 CALayer 的写法模板
+
+```objc
+- (void)addCircle3LayerAndRotateAnimation {
+    
+    //1. 创建图层，设置图层位置、大小，添加图层到图层数
+    _cirCle3Layer = [CALayer layer];
+    _cirCle3Layer.borderWidth = 1;
+    
+    //2. 只设置layer的width、height
+    _cirCle3Layer.frame = CGRectMake(0, 0, 207, 207);
+    
+    //3. 设置layer的center坐标，默认出现在anchorPoint{0.5, 0.5}的位置,也就是让layer居中显示在父layer中
+    // layer.position相当于UIView.center
+    _cirCle3Layer.position = CGPointMake(self.view.bounds.size.width/2+1,
+                                         self.view.bounds.size.height/4+1);
+    
+    //4. 添加sub layer
+    [self.view.layer addSublayer:_cirCle3Layer];
+    
+    //5. 设置动画代理
+    _cirCle3Layer.delegate = self;
+    
+    //6. 设置动画
+    [_cirCle3Layer setNeedsDisplay];
+    
+    //7. 创建核心动画，作用在layer某个属性上
+    // （默认：动画效果【不会】影响layer原有的属性值）
+    CABasicAnimation * animation = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
+    
+    //8. 动画时长
+    animation.duration = 1.0;
+    
+    //9. 动画的初始值
+    animation.fromValue = [NSNumber numberWithFloat:0];
+    
+    //10. 动画的结束时的值，旋转360度，即一群
+    // 比如，只需要旋转指定angle角度====> [NSNumber numberWithFloat:((angle * M_PI) / 180.f)]
+    animation.toValue = [NSNumber numberWithFloat:((360*M_PI)/180.f)];
+    
+    //8. 动画执行完毕之后的操作
+    //kCAFillModeForwards       保持结束时的状态
+    //kCAFillModeBackwards      回到开始时的状态
+    //kCAFillModeBoth           兼顾以上的两种效果
+    //kCAFillModeRemoved        结束时删除效果
+    animation.fillMode = kCAFillModeForwards;
+    
+    //9. 动画的重复次数（不断的重复）
+    animation.repeatCount = MAXFLOAT;
+    
+    //10. 开始动画
+    [_cirCle3Layer addAnimation:animation forKey:@"rotation"];
+}
+
+-(void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx{
+    
+    //1. 开启绘图画布
+    CGContextSaveGState(ctx);
+     
+    //2. 不停的在当前Layer的区域中，绘制图像
+    
+    //2.1
+    if (layer == _cirCle3Layer) {
+        UIImage * image = [UIImage imageNamed:@"clock_circle3"];
+        CGContextDrawImage(ctx, CGRectMake(0, 0, 207, 207), image.CGImage);
+    }
+    
+    //2.2
+    if (layer == _shizhenLayer) {
+        UIImage * image = [UIImage imageNamed:@"clock_min"];
+        CGContextDrawImage(ctx, CGRectMake(0, 0, 50, 50), image.CGImage);
+    }
+    
+    //2.3
+    if (layer == _miaozhenLayer) {
+        UIImage * image = [UIImage imageNamed:@"clock_time"];
+        CGContextDrawImage(ctx, CGRectMake(0, 0, 10, 30), image.CGImage);
+    }
+    
+    //3.
+    CGContextRestoreGState(ctx);
+}
+```
+
+
+如果`fillMode=kCAFillModeForwards和removedOnComletion=NO`,那么在动画执行完毕后，图层会保持显示动画执行后的状态。
+
+### 注意： 动画执行完毕之后，`图层的属性值`仍然是动画执行之前的数值。
+
+在屏幕上，我们看到的图层的位置、大小...确实已经发生变化了，但其实图层的属性值并没有发生改变，仍然保持动画之前的数值。
+
+可以理解为，屏幕上看到的其实是**假的**，真正的图层还是在**原来**的位置、**原来**的大小、**原来**的颜色透明的，统统都是**原来**的。
+
+## 获取block的类簇类
+
+```c
+static Class GetNSBlock() {
+    static Class _cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        id block = ^() {};
+        _cls = [block class];
+        while (_cls && (class_getSuperclass(_cls) != [NSObject class])) {
+            _cls = class_getSuperclass(_cls);
+        }
+    });
+    return _cls;
+}
+```
+
+也可以用于获取其他类型的类簇类。
+
+## block 循环引用解决之、不使用 `__weak`
+
+测试实体类
+
+```objc
+@interface MyDog : NSObject
+@property (nonatomic, strong) NSString *name;
+@end
+@implementation MyDog
+- (void)dealloc {
+    NSLog(@"%@ - %@ dealloc", self, _name);
+}
+@end
+```
+
+第一种，会自动释放废弃掉的block，捕获外部的对象。
+
+```objc
+@implementation BlockViewController
+
+- (void)test9 {
+    
+    //1.
+    MyDog *dog = [MyDog new];
+    dog.name = @"ahahha";
+    
+    //2.
+    void (^block)(void) = ^() {
+        NSLog(@"name = %@", dog.name);
+    };
+    
+    //3.
+    block();
+}
+
+@end
+```
+
+运行后输出
+
+```
+2017-03-22 13:33:42.665 Demos[8797:111915] name = ahahha
+2017-03-22 13:33:42.665 Demos[8797:111915] <MyDog: 0x600000007ca0> - ahahha dealloc
+```
+
+是可以正常废弃掉外部被持有的对象的。
+
+第二种，block被另外的对象持有时，再捕获外部的对象。
+
+```objc
+@implementation BlockViewController {
+    void (^_ivar_block)();
+}
+
+- (void)test10 {
+    
+    //1.
+    MyDog *dog = [MyDog new];
+    dog.name = @"ahahha";
+    
+    //2.
+    _ivar_block = ^() {
+        NSLog(@"name = %@", dog.name);
+    };
+    
+    //3.
+    _ivar_block();
+}
+
+@end
+```
+
+运行后输出
+
+```
+2017-03-22 13:37:55.803 Demos[8844:114742] name = ahahha
+```
+
+并没输出MyDog对象的dealloc信息。
+
+不使用 `__weak` 修饰外部对象的指针，来解决MyDog对象没有被废弃的问题:
+
+```objc
+@implementation BlockViewController {
+    void (^_ivar_block)();
+}
+
+- (void)test11 {
+    
+    //1.
+    MyDog *dog = [MyDog new];
+    dog.name = @"ahahha";
+    
+    //2.
+    _ivar_block = ^() {
+        NSLog(@"name = %@", dog.name);
+    };
+    
+    //3.
+    _ivar_block();
+    
+    //4. 一定要在最后执行
+    _ivar_block = nil;
+    
+}
+
+@end
+```
+
+先看运行输出
+
+```
+2017-03-22 13:39:21.803 Demos[8877:116163] name = ahahha
+2017-03-22 13:39:21.803 Demos[8877:116163] <MyDog: 0x600000203480> - ahahha dealloc
+```
+
+正如上面所说，block其实也是一种NSObject子类的对象。那既然是objc对象，也就会持有其他所有NSObject子类的对象。
+
+block持有objc对象，就是定义block时，在`^(){ .... }`中使用的指针所指向的对象，我个人觉得`^(){ .... }`其实就可以看做是创建一个objc对象，并且retain持有了传入的指针所指向的对象:
+
+```c
+//1.
+MyDog *dog = [MyDog new];
+dog.name = @"ahahha";
+
+//2. 如下就是创建一个block对应的objc对象，并且retain了一次外部的dog对象
+// 那么此时，dog对象的retainCount == 2
+_ivar_block = ^() {
+	NSLog(@"name = %@", dog.name);
+};
+```
+
+那么既然retain了，就必须在不再使用的时候进行release，只要保证有retain，就必须有release，保持retainCount的有加就有减，即可让外部被捕获的对象正常废弃。
+
+
+```c
+//1.
+MyDog *dog = [MyDog new];
+dog.name = @"ahahha";
+
+//2. 如下就是创建一个block对应的objc对象，并且retain了一次外部的dog对象
+// 那么此时，dog对象的retainCount == 2
+_ivar_block = ^() {
+	NSLog(@"name = %@", dog.name);
+};
+
+//3. 释放废弃掉block对象，那么被retain的dog对象，就会减少一个strong持有，
+// 继而就相当于做一次release，就保持了计数器的平衡
+_ivar_block = nil;
+```
+
+当block被废弃时，MyDog对象就会失去一个strong指向，相当于进行了一次release，然后就正常废弃了。
+
+## 三种定时器的区别: NSTimer、CADisplayLink、`dispatch_source_set_timer(source,start,interval,leeway)`
+
+### NSTimer 的使用demo
+
+
+```objc
+//1. 创建timer，设置间隔回调时间，指定回调函数
+NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(action:) userInfo:nil repeats:NO];
+
+//2. 指定timer注册到哪一个runloop下的哪一个mode下
+// 关系到是否实时回调
+[[NSRunLoop mainRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+
+//3. 不再使用timer
+[timer invalidate];
+timer = nil;
+```
+
+对于NSTimer，严重受到`RunLoop`的影响，注册到不同的mode下，只会当RunLoop处于这个mode时，才会去处理这个timer事件，就会造成某些mode时，不会进行timer的回调。
+
+NSTimer只能够自己制定间隔处理的时间，这个是与CADisplayLink最大的区别。
+
+### CADisplayLink 的使用demo，并让CADisplayLink`弱引用`持有回调对象
+
+通过block实现弱引用对象
+
+```objc
+typedef id (^XZHWeakReferenceBlcok)(void);
+
+// 使用block去持有一个 __weak 修饰的对象
+static XZHWeakReferenceBlcok MakeWeakReferenceBlcokForTarget(id target) {
+    id __weak weakTarget = target;
+    return ^() {
+        id __strong strongTarget = weakTarget;
+        return strongTarget;
+    };
+}
+
+// 执行block()获取持有的 __weak 对象
+static id GetWeakReferenceTargetFromBlock(XZHWeakReferenceBlcok block) {
+    if (!block) {return nil;}
+    return block();
+}
+```
+
+CADisplayLink使用
+
+```objc
+//1. 创建
+_displayLink = [CADisplayLink displayLinkWithTarget:GetWeakReferenceTargetFromBlock(MakeWeakReferenceBlcokForTarget(self)) selector:@selector(_displayLinkDidCallback:)];
+
+//2. 注册到runloop某一个mode
+[_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+//3. 开始
+_displayLink.paused = NO;
+
+//4. 停止
+_displayLink.paused = YES;
+[_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+[_displayLink invalidate];
+_displayLink = nil;
+```
+
+同样是受到RunLoop的运行mode的影响，但是与NSTimer的区别是，`CADisplayLink`能让我们保持与`屏幕刷新率同步的频率`去完成一些周期性的事情。
+
+### 基于`dispatch_source_t`的timer source 事件
+
+```c
+//1. source 回调执行所在的线程队列
+dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+//2. 创建基于timer类型的source
+dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,queue);
+
+//3. 设置回调间隔时间为1秒
+dispatch_source_set_timer(_timer,dispatch_walltime(NULL, 0),1.0*NSEC_PER_SEC, 0); 
+
+//4. 回调执行的代码                
+dispatch_source_set_event_handler(_timer, ^{
+    // 回调执行的代码                
+});
+
+//5. 开始处理source
+dispatch_resume(_timer);
+
+//6. 移除并停止source
+dispatch_source_cancel(_timer);
+_timer = nil;
+```
+
+由于`dispatch_source_t`类的事件基本是比较高的，不会受runloop的mode变化而受影响。
+
+## RunLoop、RunLoop的基本组成结构
+
+基本结构
+
+```c
+CFRunLoop {
+
+    //1. 当前 runloop mode
+    current mode = UIInitializationRunLoopMode,//私有的runloop mode
+
+    //2. commom runloop modes 默认包含的两种mode
+    common modes = [
+        UITrackingRunLoopMode,
+        kCFRunLoopDefaultMode,
+    ],
+
+    //3. 所有的 runloop mode下的 source0/source1/timers/observers
+    common mode items = {
+
+	    //3.1 所有的 source0 (manual) 事件
+	    CFRunLoopSource {order =-1, {callout = _UIApplicationHandleEventQueue}},
+	    CFRunLoopSource {order =-1, {callout = PurpleEventSignalCallback }},
+	    CFRunLoopSource {order = 0, {callout = FBSSerialQueueRunLoopSourceHandler}},
+	
+	    //3.2 所有的 source1 (mach port) 事件
+	    CFRunLoopSource {order = 0,  {port = 17923}},
+	    CFRunLoopSource {order = 0,  {port = 12039}},
+	    CFRunLoopSource {order = 0,  {port = 16647}},
+	    CFRunLoopSource {order =-1, { callout = PurpleEventCallback}},
+	    CFRunLoopSource {order = 0, {port = 2407, callout = _ZL20notify_port_callbackP12__CFMachPortPvlS1_}},
+	    CFRunLoopSource {order = 0, {port = 1c03, callout = __IOHIDEventSystemClientAvailabilityCallback}},
+	    CFRunLoopSource {order = 0, {port = 1b03, callout = __IOHIDEventSystemClientQueueCallback}},
+	    CFRunLoopSource {order = 1, {port = 1903, callout = __IOMIGMachPortPortCallback}},
+	
+	    //3.3 所有的 runloop Ovserver
+	    CFRunLoopObserver {order = -2147483647, activities = 0x1, callout = _wrapRunLoopWithAutoreleasePoolHandler}// Entry
+	    CFRunLoopObserver {order = 0, activities = 0x20, callout = _UIGestureRecognizerUpdateObserver}// BeforeWaiting
+	    CFRunLoopObserver {order = 1999000, activities = 0xa0, callout = _afterCACommitHandler}// BeforeWaiting | Exit
+	    CFRunLoopObserver {order = 2000000, activities = 0xa0, callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv}// BeforeWaiting | Exit
+	    CFRunLoopObserver {order = 2147483647, activities = 0xa0, callout = _wrapRunLoopWithAutoreleasePoolHandler}// BeforeWaiting | Exit
+	
+	    //3.4 所有的 Timer 事件
+	    CFRunLoopTimer {firing = No, interval = 3.1536e+09, tolerance = 0, next fire date = 453098071 (-4421.76019 @ 96223387169499), callout = _ZN2CAL14timer_callbackEP16__CFRunLoopTimerPv (QuartzCore.framework)}
+	 },
+
+    //4. 所有的运行模式modes
+    modes ＝ {
+
+        // 4.1 UITrackingRunLoopMode
+        CFRunLoopMode  {
+            name = UITrackingRunLoopMode,
+            sources0 =  [/* same as 'common mode items' */],
+            sources1 =  [/* same as 'common mode items' */],
+            observers = [/* same as 'common mode items' */],
+            timers =    [/* same as 'common mode items' */],
+        },
+
+
+        // 4.2 GSEventReceiveRunLoopMode
+        CFRunLoopMode  {
+            name = GSEventReceiveRunLoopMode,
+            sources0 =  [/* same as 'common mode items' */],
+            sources1 =  [/* same as 'common mode items' */],
+            observers = [/* same as 'common mode items' */],
+            timers =    [/* same as 'common mode items' */],
+        },
+
+        // 4.3 kCFRunLoopDefaultMode
+        CFRunLoopMode  {
+            name = kCFRunLoopDefaultMode,
+            sources0 = [
+                    CFRunLoopSource {order = 0, {callout = FBSSerialQueueRunLoopSourceHandler}},
+                ],
+            sources1 = (null),
+            observers = [
+                CFRunLoopObserver {activities = 0xa0, order = 2000000,callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv}},
+                ],
+            timers = (null),
+        },
+
+        // 4.4 UIInitializationRunLoopMode
+        CFRunLoopMode  {
+            name = UIInitializationRunLoopMode,
+            sources0 = [
+                CFRunLoopSource {order = -1, {callout = PurpleEventSignalCallback}}
+            ],
+            sources1 = [
+                CFRunLoopSource {order = -1, callout = PurpleEventCallback}}
+            ],
+            observers = (null),
+            timers = (null),
+        },
+
+        //4.5 kCFRunLoopCommonModes
+        CFRunLoopMode  {
+            name = kCFRunLoopCommonModes,
+            sources0 = (null),
+            sources1 = (null),
+            observers = (null),
+            timers = (null),
+        },
+    }
+}
+```
+
+<img src="./runloop1.png" alt="" title="" width="350"/>
+
+涉及到的主要api
+
+```
+__CFRunLoop
+	__CFRunLoopMode 1
+		CFMutableSetRef _sources0
+		CFMutableSetRef _sources1;
+		CFMutableArrayRef _observers;
+	    CFMutableArrayRef _timers;
+	__CFRunLoopMode 2
+		CFMutableSetRef _sources0
+		CFMutableSetRef _sources1;
+		CFMutableArrayRef _observers;
+	    CFMutableArrayRef _timers;
+	__CFRunLoopMode 3
+		CFMutableSetRef _sources0
+		CFMutableSetRef _sources1;
+		CFMutableArrayRef _observers;
+	    CFMutableArrayRef _timers;
+```
+
+## RunLoop、只要thread成功开启runloop（需要添加source）。那么有，一、局部thread对象`不会`被废弃。二、会卡住thread入口函数中`[runloop run];`后面的代码执行
+
+```objc
+#import <Foundation/Foundation.h>
+
+@interface MyThread : NSThread
+
+@end
+@implementation MyThread
+- (void)dealloc {
+    NSLog(@"MyThread dealloc >>>> %@", self);
+}
+@end
+```
+
+```objc
+@implementation ViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    
+    // 局部thread对象
+    MyThread *t = [[MyThread alloc] initWithTarget:self selector:@selector(doInitThread) object:nil];
+    [t start];
+}
+
+- (void)doInitThread {
+    //1.
+    NSThread *t = [NSThread currentThread];
+    
+    //2.
+    [t setName:@"MyThread"];
+    
+    //3. Foundation版本、开启当前线程的runloop
+    {
+        //3.1
+        NSRunLoop *runloop = [NSRunLoop currentRunLoop];
+        
+        //3.2
+        NSLog(@"doInitThread >>>> 添加port事件之前");
+        
+        //3.3 【重要】 注释下面这句添加事件源的代码
+        [runloop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+        
+        //3.4
+        NSLog(@"doInitThread >>>> 添加port事件之后, runloop还未开启");
+        
+        //3.5
+        [runloop run];
+        
+        //3.6   
+        NSLog(@"doInitThread >>>> runlop开始执行");
+    }
+    
+    //4. 
+    NSLog(@"MyThread doInitThread >>>> %@", [NSThread currentThread]);
+}
+
+@end
+```
+
+程序运行后的输出
+
+```
+2016-11-27 17:08:26.499 RunLoopBasic[8294:108202] doInitThread >>>> 添加port事件之前
+2016-11-27 17:08:26.500 RunLoopBasic[8294:108202] doInitThread >>>> 添加port事件之后, runloop还未开启
+```
+
+可以看到:
+
+(1) 局部创建的thread对象，并没有被废弃
+(2) 同样doInitThread实现内的流程会卡在3.5句代码`[runloop run];`地方，不会再往下执行
+
+如果想要将自己创建的NSThread对象，永远保持存活状态（并不只是不废弃，而是随时能够接受线程任务执行），就需要给线程做几件事：
+
+- (1) 获取线程的runloop
+- (2) 创建RunLoopSource，并添加到runloop
+- (3) `[runloop run]`开起runloop
+
+这样之后，线程的state才会一直是`isExecuting`，否则就是`isFinished`。
+
+## RunLoop、在自定义线程上使用释放池
+
+```objc
++ (NSThread *)networkRequestThread {
+	static NSThread *_networkRequestThread = nil;
+	static dispatch_once_t oncePredicate;
+	dispatch_once(&oncePredicate, ^{
+	    
+		//1. 创建单例NSThread对象
+		_networkRequestThread = [[NSThread alloc] initWithTarget:self selector:@selector(networkRequestThreadEntryPoint:) object:nil];
+		
+		//2. 开启线程对象
+		[_networkRequestThread start];
+	});
+
+	return _networkRequestThread;
+}
+
+///NSThread入口函数
++ (void)networkRequestThreadEntryPoint:(id)__unused object {
+
+	// 使用释放池进行包裹
+	@autoreleasepool {
+		[[NSThread currentThread] setName:@"AFNetworking"];
+		NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+		[runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+		[runLoop run];
+	}
+}
+```
+
+对于自己创建的`NSThread`子线程，一定要手动创建释放池。
+
+## RunLoop、给子线程的runloop添加2个Observer，用来给子线程永远保持一个最新鲜的释放池
+
+提供NSThread分类方法创建释放池的入口
+
+```objc
+// 标记是否创建过释放池
+static NSString *const kXZHNSThreadAutoleasePoolKey      = @"XZHNSThreadAutoleasePoolKey";
+
+// 标记存储释放池数组
+static NSString *const kXZHNSThreadAutoleasePoolStackKey = @"XZHNSThreadAutoleasePoolStackKey";
+
+@implementation NSThread (XZHAddtions)
+
++ (void)xzh_addAutoreleasePool {
+
+    //1. 主线程thread，会自己创建释放池
+    if ([NSThread isMainThread]) {return;}
+    
+    //2. 线程的字典对象
+    NSMutableDictionary *threadDic = [NSThread currentThread].threadDictionary;
+    
+    //2. 是否已经创建了释放池
+    if ([threadDic objectForKey:kXZHNSThreadAutoleasePoolKey]) {return;}
+    
+    //4. 给当前线程创建释放池
+    AutoreleasePoolSetup();
+    
+    //5. 标记当前线程已经创建了释放池
+    [threadDic setObject:kXZHNSThreadAutoleasePoolKey forKey:kXZHNSThreadAutoleasePoolKey];
+}
+
+@end
+```
+
+`AutoreleasePoolSetup()`完成给线程注册释放池，子线程的runloop添加两个observer.
+
+```c
+static void AutoreleasePoolSetup() {
+
+    //1. 给runloop添加第一个observer
+    AddRunLoopObserverForAutoreleasePoolPush();
+    
+    //2. 给runloop添加第二个observer
+    AddRunLoopObserverForAutoreleasePoolPop();
+}
+```
+
+给runloop添加第一个observer: `AddRunLoopObserverForAutoreleasePoolPush();`完成创建释放池，监听`kCFRunLoopEntry`，其oder最大，表示优先级最高
+
+```c
+static void AddRunLoopObserverForAutoreleasePoolPush() {
+    
+    /**
+     *  注意: 使用CoreFoundation版本的RunLoop的api，因为是线程安全的
+     */
+
+    //1. 获取/创建 当前线程的runloop
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    
+    //2. 创建 runloop observer，监听 `runloop进入`的状态
+    /*
+    创建runloop observer函数的参数意义:
+    CFRunLoopObserverCreate(CFAllocatorRef allocator,
+                            CFOptionFlags activities,//监听runloop的哪一个状态
+                            Boolean repeats,//重复性不断监听
+                            CFIndex order,//RunLoopObserver的优先级，当在Runloop同一运行阶段中有多个CFRunLoopObserver时，根据这个来先后调用，CFRunLoopObserver，默认值是0
+                            CFRunLoopObserverCallBack callout,//observer回调c函数
+                            CFRunLoopObserverContext *context);//用于给observer回调c函数中，传递参数的context
+     */
+    
+    /**
+     *  observer的优先级最大:
+     *  0x7FFFFFFF是一个十六进制数
+     *  转成二进制数==>0111,1111,1111,1111,1111,1111,1111,1111==>32位二进制数，第一位0，表示正数
+     *  而int类型变量占用32个二进制位，第一位是符号位（表示正负数），后面31位是数值位
+     *  所以，0x7FFFFFFF表示最大的int类型正数，也可以使用 INT_MAX 代替
+     */
+    CFIndex order = 0x7FFFFFFF;
+    CFRunLoopObserverRef pushObserver = NULL;
+    pushObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
+                                           kCFRunLoopEntry,
+                                           true,
+                                           order,
+                                           XZHCFRunLoopObserverCallBack,
+                                           NULL);
+    
+    //3. observer注册给runloop，注意runloop mode >>> commom modes
+    CFRunLoopAddObserver(runLoop, pushObserver, kCFRunLoopCommonModes);
+    
+    //4.
+    CFRelease(pushObserver);
+}
+```
+
+给runloop添加第二个observer: `AddRunLoopObserverForAutoreleasePoolPop();`完成释放释放池，监听`kCFRunLoopBeforeWaiting 与 kCFRunLoopExit`，其oder最`小`，表示优先级最`低`
+
+```c
+static void AddRunLoopObserverForAutoreleasePoolPop() {
+
+    //1.
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    
+    //2. runloop observer 优先级最低:
+    CFIndex order = -0x7FFFFFFF;
+    
+    //3. 监听runloop状态: 休眠、退出执行
+    CFRunLoopObserverRef popObserver = NULL;
+    popObserver = CFRunLoopObserverCreate(CFAllocatorGetDefault(),
+                                          kCFRunLoopBeforeWaiting | kCFRunLoopExit,
+                                          true,
+                                          order,
+                                          XZHCFRunLoopObserverCallBack,
+                                          NULL);
+    
+    //4.
+    CFRunLoopAddObserver(runLoop, popObserver, kCFRunLoopCommonModes);
+    
+    //5.
+    CFRelease(popObserver);
+}
+```
+
+两个observer统一走的回调函数
+
+
+```c
+static void XZHCFRunLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *context)
+{
+	// 根据当前runloop的状态进行不同的操作
+    switch (activity) {
+            
+        //状态一、runloop即将进入
+        case kCFRunLoopEntry: {
+            XZHAutoreleasePoolPush();// 直接创建新的释放池
+        }
+            break;
+            
+        //状态二、runloop即将休眠
+        case kCFRunLoopBeforeWaiting: {
+            XZHAutoreleasePoolPop();// 先废弃老的释放池
+            XZHAutoreleasePoolPush();// 再创建新的释放池
+        }
+            break;
+            
+        //状态三、runloop即将退出
+        case kCFRunLoopExit: {
+            XZHAutoreleasePoolPop();// 直接释放老的释放池
+        }
+            break;
+            
+        default:
+            break;
+    }
+}
+```
+
+从上面的逻辑可以看出，主要是三种状态：
+
+- (1) runloop即将进入，直接创建释放池
+- (2) runloop即将睡眠，先释放掉老的释放池，再重新创建一个新的释放池
+- (3) runloop即将退出，直接释放持有的释放池
+
+`XZHAutoreleasePoolPush()`  直接创建新的释放池
+
+```c
+static inline void XZHAutoreleasePoolPush() {
+    
+    //1. 读取线程对象的字典
+    NSMutableDictionary *dic =  [NSThread currentThread].threadDictionary;
+
+    //2. 获取线程对象存储的pool数组对象
+    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([dic objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
+    
+    //3. 如果pool数组不存在，则先创建数组对象，并存入到线程字典对象中
+    if (!autoreleasePools) {
+        autoreleasePools = CFArrayCreateMutable(kCFAllocatorDefault, 1, NULL);
+        [dic setObject:(__bridge id)(autoreleasePools) forKey:kXZHNSThreadAutoleasePoolStackKey];
+        CFRelease(autoreleasePools);
+    }
+    
+    //4. 创建新的pool对象，并加入到数组最后一个位置
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    CFArrayAppendValue(autoreleasePools, (__bridge void*)(pool));
+}
+```
+
+`XZHAutoreleasePoolPop()`完成释放掉现在的释放池
+
+```c
+static inline void XZHAutoreleasePoolPop() {
+
+    //1. 获取线程对象存储的pool数组对象
+    CFMutableArrayRef autoreleasePools = (__bridge CFMutableArrayRef)([[NSThread currentThread].threadDictionary objectForKey:kXZHNSThreadAutoleasePoolStackKey]);
+    
+    //2. 获取最后的一个pool
+    NSAutoreleasePool *lastPool = CFArrayGetValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
+    
+    //3. 清除pool中的所有的对象
+    [lastPool drain];
+    
+    //4. 移除pool
+    CFArrayRemoveValueAtIndex(autoreleasePools, CFArrayGetCount(autoreleasePools)-1);
+}
+```
+
+## RunLoop、界面重绘的过程 
+
+- (1) 注册关注MainRunLoop的如下状态改变，是MainRunLoop最清闲的时候
+	- `kCFRunLoopBeforeWaiting` 即将休息
+	- `kCFRunLoopExit` 即将退出
+
+- (2) 即将重绘的UIView对象、哪一个属性值（font、textColor、backgroudColor...） 被CoreAnimation打包为一个`CATransaction`对象
+	- (2.1) 指定哪一个UIView对象的CALayer
+	- (2.2) 要触发哪一个属性值（font、textColor、backgroudColor...）的重绘
+	- (2.3) `[CATransaction commit]` 提交
+
+- (3) CATransaction提交后，只是暂时保存到一个临时缓存区，类似于NSSet集合
+
+- (4) 等待MainRunLoop处于`kCFRunLoopBeforeWaiting 或 kCFRunLoopExit`状态回调时，再将上面的存放在临时缓存区中的`CATransaction对象的消息发送事件`，**注册**到MainRunLoop
+	- 只是注册到MainRunLoop，而MainRunLoop并不会立刻去处理消息发送
+	- 注册完毕，MainRunLoop休息了
+	
+- (5) 等待MainRunLoop被唤醒，开始新的一轮回时，就会处理上一轮回注册的`CATransaction对象的消息发送事件`
+
+利用了RunLoop处于最清闲的时刻，将多个重绘操作，按照RunLoop的每一个轮回，切割为多个批次进行重绘。
+
+## delegate是1对1的，只能覆盖式设置，可以预先将别人的delegate保存起来
+
+```objc
+static id<UITableViewDelegate> otherDelegate;
+
+@implementation ViewController {
+    UITableView *_tv;
+}
+
+- (void)test {
+    
+    //1.
+    otherDelegate = _tv.delegate;
+    
+    //2.
+    _tv.delegate = self;
+}
+
+- (void)tableView:(UITableView *)tableView didDeselectRowAtIndexPath:(NSIndexPath *)indexPath {
+    
+    //1. 我们先做点处理
+    //......
+    
+    //2. 再通知其他的delegate回调
+    if ([otherDelegate respondsToSelector:@selector(tableView:didDeselectRowAtIndexPath:)]) {
+        [otherDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+    }
+}
+
+@end
+```
+
+## 程序崩溃监控
+
+### 分为两种崩溃
+
+- (1) `objc` 代码崩溃
+- (2) `c/c++` 代码崩溃
+
+对于`(1)`种代码崩溃，一般情况下都能快速定位。而对于`(2)`代码崩溃，直接蹦到main函数中，很难排查。
+
+
+### 同时监听这两种代码崩溃
+
+```c
+void uncaughtExceptionHandler(NSException *exception)
+{
+    //1. 异常的堆栈信息
+    NSArray *stackArray = [exception callStackSymbols];
+    
+    //2. 出现异常的原因
+    NSString *reason = [exception reason];
+
+    //3. 异常名称
+    NSString *name = [exception name];
+    
+    //4. 调用栈详细信息
+    NSString *exceptionInfo = [NSString stringWithFormat:@"Exception reason：%@\nException name：%@\nException stack：%@",name, reason, stackArray];
+}
+```
+
+```c
+void SignalCallbackFunc(int code) {
+    switch (code) {
+        case SIGSEGV: { /* ... */ }
+            break;
+        case SIGABRT: { /* ... */ }
+            break;
+        case SIGILL: { /* ... */ }
+            break;
+        case SIGFPE: { /* ... */ }
+            break;
+        case SIGBUS: { /* ... */ }
+            break;
+        case SIGPIPE: { /* ... */ }
+            break;
+    }
+}
+
+void InstallUncaughtExceptionHandler() {
+    
+    //1. 无效指针、空指针、指针未初始化、栈溢出
+    signal(SIGSEGV, SignalCallbackFunc);
+    
+    //2. 接收到abort()信号
+    signal(SIGABRT, SignalCallbackFunc);
+    
+    //3. 总线错误（什么意思...）
+    signal(SIGILL, SignalCallbackFunc);
+    
+    //4. 数学计算问题，比如 1/0
+    signal(SIGFPE, SignalCallbackFunc);
+    
+    //5. 非法指令，或者没有权限
+    signal(SIGBUS, SignalCallbackFunc);
+    
+    //6. 管道另一边没有进程接受数据
+    signal(SIGPIPE, SignalCallbackFunc);
+}
+```
+
+```objc
+@implementation AppDelegate
+
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+
+    //1. 注册监听objc代码崩溃（同样和覆盖delegate一样，先保存其他的函数指针）
+    NSSetUncaughtExceptionHandler(&uncaughtExceptionHandler);
+    
+    //2. 注册监听c/c++代码崩溃（同样和覆盖delegate一样，先保存其他的函数指针）
+    InstallUncaughtExceptionHandler();
+    
+    return YES;
+}
+
+@end
+```
+
+## 运行时内存监控
+
+### 通常情况下内存泄露的情况
+
+- (1) UINavigationController 在 pop 一个ViewController对象后，这个ViewController对象没有从内存中废弃
+
+- (2) block与其他对象之间的循环强引用
+
+- (3) delegate与其他对象之间的循环强引用
+
+- (4) objc对象之间的循环强引用
+
+### 主要有两个开源的监测代码
+
+- (1) MLeaksFinder，只能指针基于`UINavigationController`的pop ViewController的检测
+
+- (2) FBMemoryProfiler，比上面的更强大，增加对循环强引用对象的检测
+
+### MLeaksFinder 实现原理
+
+第一步、替换掉UIViewController的如下几个对象方法实现，来跟踪UIViewController对象的声生命周期
+
+```objc
+[self swizzleSEL:@selector(viewDidDisappear:) withSEL:@selector(swizzled_viewDidDisappear:)];
+[self swizzleSEL:@selector(viewWillAppear:) withSEL:@selector(swizzled_viewWillAppear:)];
+[self swizzleSEL:@selector(dismissViewControllerAnimated:completion:) withSEL:@selector(swizzled_dismissViewControllerAnimated:completion:)];
+```
+
+第二步、替换掉UINavigationController的如下几个对象方法实现，来监控对VC的push与pop
+
+
+```objc
+[self swizzleSEL:@selector(pushViewController:animated:) withSEL:@selector(swizzled_pushViewController:animated:)];
+[self swizzleSEL:@selector(popViewControllerAnimated:) withSEL:@selector(swizzled_popViewControllerAnimated:)];
+[self swizzleSEL:@selector(popToViewController:animated:) withSEL:@selector(swizzled_popToViewController:animated:)];
+[self swizzleSEL:@selector(popToRootViewControllerAnimated:) withSEL:@selector(swizzled_popToRootViewControllerAnimated:)];
+```
+
+第三步、在拦截替换的popVC方法实现中
+
+```objc
+__weak id weakSelf = self;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    __strong id strongSelf = weakSelf;
+    [strongSelf assertNotDealloc];
+});
+```
+
+延迟2秒执行通过分类添加的`assertNotDealloc`方法实现。
+
+`__weak`指针指向的对象被废弃时，会自动赋值为`nil`。所以，如果ViewController对象被废弃，那么2秒后，assertNotDealloc这个消息不会发送，啥事都没有。
+
+而如果两秒后，ViewController对象没有废弃，那么assertNotDealloc消息将会被发送。
+
+而assertNotDealloc消息，就是让程序崩溃。
+
+### FBMemoryProfiler
+
+待学习。
+
+## FPS实时计算
+
+通过`block` + `__weak`实现objc对象的弱引用。
+
+```c
+
+typedef id (^XZHWeakReferenceBlcok)(void);
+
+static XZHWeakReferenceBlcok MakeWeakReferenceBlcokForTarget(id target) {
+    id __weak weakTarget = target;
+    return ^() {
+        id __strong strongTarget = weakTarget;
+        return strongTarget;
+    };
+}
+static id GetWeakReferenceTargetFromBlock(XZHWeakReferenceBlcok block) {
+    if (!block) {return nil;}
+    return block();
+}
+```
+
+创建CADisplayLink（屏幕刷新定时器），并注册到`主线程的 RunLoop`
+
+```objc
+//1.
+_displayLink = [CADisplayLink displayLinkWithTarget:GetWeakReferenceTargetFromBlock(MakeWeakReferenceBlcokForTarget(self))
+                                                   selector:@selector(_displayLinkDidCallback:)];
+                                                   
+//2.
+[_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+//3. 
+_displayLink.paused = NO;
+```
+
+CADisplayLink没当屏幕进行绘制时，都会回调的函数实现
+
+```objc
+- (void)_displayLinkDidCallback:(CADisplayLink *)displayLink {
+
+    //第一次屏幕绘制，只记录开始时间
+    if (_lastTime == 0) {
+        _lastTime = displayLink.timestamp;
+        return;
+    }
+    
+    // 第二次及以后进行屏幕绘制
+    _count++;
+    CFTimeInterval duration = displayLink.timestamp - _lastTime;
+    if (duration < 1.0) {return;}
+    _lastTime = displayLink.timestamp;
+    
+    // 每一次屏幕绘制需要的单位时间 = 屏幕绘制的总次数 / 总时间
+    NSInteger fps = lround(_count/duration);
+#if DEBUG
+    NSLog(@"fps = %ld", fps);
+#endif
+    
+    // 设置fps label显示内容
+    _fpsLabel.text = [NSString stringWithFormat:@"%@ FPS", @(fps)];
+    if (fps >= kNormalFPS) {
+        _fpsLabel.textColor = [UIColor greenColor];
+    } else if (fps >= kLowerFPS) {
+        _fpsLabel.textColor = [UIColor colorWithRed:255/255.0 green:215/255.0 blue:0/255.0 alpha:1];
+    } else {
+        _fpsLabel.textColor = [UIColor redColor];
+    }
+    
+    // 清空数据，等待下一次的FPS计算
+    _count = 0;
+}
+```
+
+不再需要监控屏幕刷新频率就移除CADisplayLink事件
+
+```objc
+_displayLink.paused = YES;
+[_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+[_displayLink invalidate];
+```
