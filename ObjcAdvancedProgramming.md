@@ -56,25 +56,271 @@ for (id obj in objs) {....}
 
 尽量的将如上步骤，全部放到子线程异步执行。
 
-## 从创建各种UIView，到对UIView设置各种显示的数据，到最终屏幕上显示的过程
+## 创建CALayer的contents的三个途径
+
+```
+1. 在创建CALayer时，就设置一个图片显示
+2. 实现CALayerDeleate中的绘制函数
+3. 重写CALayer子类的绘制函数
+```
+
+### 一、直接给UIView或CALayer的contents设置一个显示的图像
+
+```objc
+@implementation ViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    
+    //1. 设置UIView的背景色
+    UIView *view1 = [[UIView alloc] initWithFrame:CGRectMake(10, 10, 300, 200)];
+    view1.backgroundColor = [UIColor blackColor];
+    [self.view addSubview:view1];
+    NSLog(@"view1.layer.contents = %@", view1.layer.contents);
+    
+    //2. 设置UIView的文本内容
+    UILabel *view2 = [[UILabel alloc] initWithFrame:CGRectMake(10, 250, 300, 40)];
+    view2.text = @"我是你妈妈咪";
+    view2.textColor = [UIColor redColor];
+    [self.view addSubview:view2];
+    NSLog(@"view2.layer.contents = %@", view2.layer.contents);
+    
+    //3. 设置UIView的背景图片
+    UIImageView *view3 = [[UIImageView alloc] initWithFrame:CGRectMake(10, 300, 300, 200)];
+    view3.image = [UIImage imageNamed:@"demo"];
+    [self.view addSubview:view3];
+    NSLog(@"view3.layer.contents = %@", view3.layer.contents);
+}
+
+@end
+```
+
+程序运行起来之后，打印分别如下
+
+```
+2017-03-25 11:34:19.013 Demo[1215:13225] view1.layer.contents = (null)
+
+2017-03-25 11:34:19.028 Demo[1215:13225] view2.layer.contents = (null)
+
+2017-03-25 11:34:19.034 Demo[1215:13225] view3.layer.contents = <CGImage 0x6000001dc4d0>
+	<<CGColorSpace 0x600000037bc0> (kCGColorSpaceICCBased; kCGColorSpaceModelRGB; sRGB IEC61966-2.1)>
+		width = 544, height = 184, bpc = 8, bpp = 32, row bytes = 2176 
+		kCGImageAlphaPremultipliedLast | 0 (default byte order) 
+		is mask? No, has mask? No, has matte? No, should interpolate? Yes
+```
+
+前面两种情况时CALayer的contents还不存在，但是设置了图片之后，contents就存在了，且存储的数据类型是`CGImage`。
+
+### 二、在CALayerDelegate回调函数中创建contents
+
+```objc
+@implementation ViewController {
+	UIView *view1;
+}
+
+@implementation BasicViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+
+    [self test2];
+}
+
+- (void)test2 {
+    
+    //1.
+    view1 = [[UIView alloc] initWithFrame:CGRectMake(10, 10, 300, 200)];
+    [self.view addSubview:view1];
+    
+    //2.
+    view1.layer.delegate = self;
+    
+    //3. 调用setNeedsDisplay，无法创建contents
+//    [view1.layer setNeedsDisplay];
+    
+    //4. 必须强制调用layer的display，才能创建contents
+    [view1.layer display];
+    
+    //5.
+    NSLog(@"log1 >>>> view1.layer.contents = %@", view1.layer.contents);
+}
+
+- (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx {
+    
+    // 即使不是有如下绘制的代码，contents其实在调用这个方法之前，已经创建完毕
+//    CGContextSetLineWidth(ctx, 10.0f);
+//    CGContextSetStrokeColorWithColor(ctx, [UIColor redColor].CGColor);
+//    CGContextStrokeEllipseInRect(ctx, layer.bounds);
+    
+    NSLog(@"log2 >>>> view1.layer.contents = %@", view1.layer.contents);
+}
+
+@end
+```
+
+输出如下
+
+```
+2017-03-26 20:06:44.112 AnimationsDemo[1559:17003] log2 >>>> view1.layer.contents = (null)
+2017-03-26 20:06:44.113 AnimationsDemo[1559:17003] log1 >>>> view1.layer.contents = <CABackingStore 0x7fb9925c9cd0 (buffer [300 200] BGRA8888)>
+```
+
+在调用`-[CALayer drawLayer:inContext:]`之前，CALayer的contents就有数据了。也就是说，我们在`drawLayer:inContext:`什么都不做，contents其实早已经创建好了。
+
+这个情况下的值类型是`CABackingStore`，而上面通过设置图片之后的contents类型是`CGImage`。
+
+注意，一定要使用`-[CALayer display]`才能完成创建CALayer的contents。
+
+### 三、重写CALayer的draw方法创建contents
+
+自定义CALayer子类
+
+```objc
+@interface MyLayer : CALayer
+
+@end
+@implementation MyLayer
+
+//实现方式一、一个空实现
+- (void)drawInContext:(CGContextRef)ctx {
+	NSLog(@"log2 >>>> view1.layer.contents = %@", self.contents);
+}
+
+
+/** 
+实现方式二、具体做一些绘制
+- (void)drawInContext:(CGContextRef)ctx {
+    
+    //1.
+    CGContextSetLineWidth(ctx, 10.0f);
+    CGContextSetStrokeColorWithColor(ctx, [UIColor redColor].CGColor);
+    CGContextStrokeEllipseInRect(ctx, self.bounds);
+    
+    //2.
+    NSLog(@"log2 >>>> layer1.contents = %@", self.contents);
+}
+*/
+
+@end
+```
+
+```objc
+@implementation BasicViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+	[self test3];
+}
+
+- (void)test3 {
+
+    //1.
+    view1 = [[UIView alloc] initWithFrame:CGRectMake(10, 100, 200, 100)];
+    [self.view addSubview:view1];
+    
+    //2.
+    layer1 = [MyLayer layer];
+    layer1.frame = view1.bounds;
+    layer1.backgroundColor = [UIColor blueColor].CGColor;
+    [view1.layer addSublayer:layer1];
+    
+    //3. 必须如下的display，强制进行绘图
+//    [layer1 setNeedsDisplay];
+    
+    //4.
+    [layer1 display];
+    
+    //5.
+    NSLog(@"log1 >>>> layer1.contents = %@", layer1.contents);
+}
+
+@end
+```
+
+输出如下
+
+```
+2017-03-26 20:26:50.474 AnimationsDemo[1738:30404] log2 >>>> view1.layer.contents = (null)
+2017-03-26 20:26:50.475 AnimationsDemo[1738:30404] log1 >>>> layer1.contents = <CABackingStore 0x7fbba364d260 (buffer [200 100] BGRA8888)>
+```
+
+只要实现了`-[CALayer drawInContext:]`，不管有没有进行绘制，都会直接创建CALayer的contents。
+
+### 小结如上三种创建contents的方法
+
+总而言之，在执行了`-[CALayer display]`之后，通过如上三种途径，CALayer的contents就已经存在数据了。只是存在的数据格式不同:
+
+- (1) CGImage
+- (2) CABackingStore
+
+后期对CALayer做的各种CoreAnimation动画，其实只是根据CALayer对象缓存的contents进行临时计算绘制，并显示到屏幕上，但其实CALayer的属性值和contents并没有真正的改变。
+
+### 对于如上直接创建CALayer的contents的优化
+
+- (1) 使用 **专用图层** 进行绘制，不要使用如上方法二、方法三，可延迟创建contents
+
+- (2) 提前在子线程将绘制的内容，渲染成为bitmap，然后塞给contents保存
+
+## UIView显示到屏幕上的过程
+
+http://wiki.jikexueyuan.com/project/ios-core-animation/performance-tuning.html
+
+### 大致分为三部分:
+
+- (1) CPU的处理
+- (2) GPU的处理
+- (3) 绘图硬件的绘制和渲染、最终显示器数据显示
 
 ### 一、CPU处理部分
 
-- (1) UIView对象的创建，以及内部的CALayer对象创建，以及其他辅助对象的创建
+- (1) UIView对象的创建、废弃
 
-- (2) 读取并触发图片文件的解压缩，读取文本数据
+- (2) 读取文本数据、图片数据。如果是对于图片，还需要完成:
+	- (2.1) 读取图片时，触发图片的压缩文件的`解压缩`，解压后的文件会`比较大`
+	- (2.2) 当需要绘制图片时，还需要对压缩图片进行`解码`
 
-- (3) 将设置给UIView对象的 图像、文本、背景色、字体... 全部设置给CALayer
+- (3) 各种数据计算，然后设置给UIView对象，底层再同步设置给内部的CALayer
+	- (3.1) 文本尺寸计算
+	- (3.2) 图像尺寸计算
+	- (3.3) frame计算
+	- (3.4) 背景色、字体、边框、阴影...
+	- (3.5) 所有的设置，同步给UIView对象内部的CALayer对象
 
-- (4) 文本尺寸计算，frame计算，调整UIView对象的frame，实际上就是调整CALayer的各种属性值
+- (4) CALyer显示 即 `[CALayer display]` 被调用，此时会完成CALayer的contents创建。包括上面提到的三个途径:
+	- (4.1) `-[CALayer display] 或 -[CALayer setNeedsDisplay]`方法调用
+	- (4.2) 继而调用 `-[CALayer drawInContext:]` 或 `CALayerDelegate`、`重写CALayer drawInContext` 
+	- (4.3) 到此为止，CALayer的`contents`已经创建完毕
+	- (4.4) 如果预先设置了一个图片给UIView或CALayer，那么此时contents的类型是`CGImage`
+		- (4.4.1) 这种情况是在`主线程`完成图片的解压、解码、绘制、渲染
+		- (4.4.2) 最后是在`子线程`完成图片的解压、解压、绘制、渲染，得到bitmap，然后设置给CALayer的contents
+	- (4.5) 如果没有设置图片，contents类型是`CABackingStore`
+	- (4.6) 总之对于 CALayer 初始化时 显示的数据，已经渲染完毕
 
-- (5) 将对CALayer每一个属性值修改，需要完成的重绘操作，打包成一个`CATransaction`
+- (5) `后续` 再对CALayer属性值做出的每一个修改，都打包为`CATransaction`，并临时提交到一个**全局缓存容器**
+	- (5.1) 系应该 CALayer 的属性值，然后调用 `setNeedsDisplay`，将此 CALayer 标记为 `待处理`，也就是需要重新进行绘制
+	- (5.2) 开始一个事务来包裹CALayer的重绘 `-[CATransaction begin]`
+		- (5.2.1) 读取哪一个 CALayer 的 contents
+		- (5.2.2) 针对CALayer的哪一个属性值（font、textColor、backgroudColor ... ）进行绘制和渲染
+	- (5.3) 如果需要进行图片的绘制，则此时还要进行 `图片的解码`
+	- (5.4) 结束并 **提交** 绘制操作的事务  `-[CATransaction commit]`
+	- (5.5) 将执行commit消息的 transaction 临时保存到 `全局缓存容器`
 
-- (6) 或者是重写`-[CALayer drawLayer:inContext:] 或 -[UIView drawRect:]`完成的每一个自定义绘制，打包成一个`CATransaction`
+- (6) 当 **我们的程序进程中的主线程 RunLoop** 处于 `即将退出、即将休息` 状态回调时，从 **全局缓存容器** 取出全部 `CATransaction` 绘制操作，发送给 **RenderServer单独进程** 进行绘制和渲染
+	- (6.1) 将所有的 transaction 发送给 `RenderServer` 去处理
+	- (6.2) 发送完毕之后，`RunLoop 就休息` 了
+	- (6.3) RenderServer 取出每一个 transaction 进行如下处理
+	- (6.4) 取出 CALayer 的 contents
+	- (6.5) 取出被修改的 CALayer 属性值
+	- (6.6) 根据 `CALayer对象当前的属性值` ，对 contents 做一些图像的合成处理等
+	- (6.7) 将处理后的数据 **再次** 显示到屏幕上
+	- (6.8) 通过之前添加的 `CFRunLoopSource 1` 主动回调唤醒 RunLoop ，告知已经渲染完毕，可以继续进行其他的绘制操作了
+	- (6.9) 我们的App程序进程的主线程RunLoop接收到基于`mach_port`通知被唤醒，继续分配其他的绘制
 
-- (7) 在RunLoop处于最清闲的时刻，将一个个的`CATransaction`重绘操作，发送给RenderServer进行`渲染`
+- (7) 这里需要注意，几个单独的东西
+	- (7.1) 我们的App程序进程 和 渲染服务进程，不是同一个进程
+	- (7.2) 上面说的 RunLoop 是属于 我们App程序进程中的 主线程的 RunLoop
+	- (7.3) 渲染服务进程 完成任务后，通知 我们的App程序进程中主线程的 RunLoop
 
-到此，就开始到下面第二个处理部分，GPU的渲染。
 
 ### 二、GPU处理部分	
 
@@ -82,19 +328,17 @@ for (id obj in objs) {....}
 
 - (2) 如果添加了`CAAnimation`动画，则根据动画执行过程，使用`OpenGL`进行计算、进行渲染成为一帧一帧的`bitmap位图`
 
-- (3) 对设置的图片进行`解码`，渲染成为`bitmap位图`
+- (3) 对设置的 图片、文本、绘制的图形 渲染成为`bitmap位图`
 
-- (4) 对设置的文本进行渲染，同样渲染成为`bitmap位图`
+- (4) 对多个`bitmap位图`进行混合处理
 
-- (5) 对多个`bitmap位图`进行混合处理
+- (5) 并对多个层级关系的CALayer各自渲染得到的`bitmap位图`，进行混合处理
 
-- (6) 并对多个层级关系的CALayer各自渲染得到的`bitmap位图`，进行混合处理
+- (6) 将最终混合完毕得到的`bitmap位图`，继续渲染为显示器硬件能识别的`纹理`格式，并存入到帧缓冲池中
 
-- (7) 将最终混合完毕得到的`bitmap位图`，继续渲染为显示器硬件能识别的`纹理`格式，并存入到帧缓冲池中
+- (7) 通知显示器硬件去帧缓冲池，读取镇数据，进行屏幕的绘制
 
-- (8) 通知显示器硬件去帧缓冲池，读取镇数据，进行屏幕的绘制
-
-### 三、屏幕重绘操作部分 
+### 三、屏幕显示部分 
 
 - (1) 显示器从镇缓存池中，取出当前帧要显示的帧数据
 - (2) 将帧数据显示到显示器硬件上
@@ -103,7 +347,11 @@ for (id obj in objs) {....}
 
 - (1) 将第一部分，除开UIKit对象之外，全部放到子线程异步完成，并且能够缓存就缓存
 
-- (2) 尽量将第二部分的CALayer数据的渲染，提前在子线程异步完成，也就是尽量直接进入第二部分的`(7)`步
+- (2) 尽量将第二部分的CALayer数据的渲染，提前在子线程异步完成
+
+- (3) 本地高清大图切割加载
+
+- (4) 网络web高清大图分多规格多次拉取，并结合ImageIo渐进式图像加载
 
 ## UI性能、使用 `[CALayer renderInContext:]` 将CALayer在子线程完成渲染并得到Image，然后直接塞给`CALayer.contents`显示
 
@@ -584,6 +832,75 @@ static IMP PersonIMP2;
 2017-02-08 22:47:46.586 Test[805:25490] log1 name = 我是参数
 2017-02-08 22:47:46.587 Test[805:25490] log2 name = 我是参数
 ```
+
+## 事件传递 与 事件响应链
+
+### 事件传递
+
+- (1) 当屏幕上产生一个触摸事件之后， `UIApplication` 对象的 `sendEvent:` 方法实现会被调用
+
+- (2) 其中传入的 UIEvent对象 包含了 当前 UIWindow上产生触摸点事件的所有信息
+
+- (3) 然后 UIApplication 将 UIEvent对象 传递给 UIWindow
+
+- (4) UIWindow 将 UIEvent对象 传递给 RootViewController
+
+- (5) RootViewController 将 UIEvent对象 传递给 RootView
+
+- (6) RootView 将 UIEvent对象 传递给 所有的 subviews 
+
+- (7) 继续向 subviews 依次询问 是否能够 处理这个 UIEvent对象
+	- 是否 打开交互、大小不为0，不透明，没有隐藏
+	- 触摸点是否处于当前view的frame区域内
+	- 如果当前view能处理，则继续向自己的subviews继续传递 UIEvent对象
+	- 如果当前view的subviews都不能处理，则将返回自己作为hitTest的对象
+
+	
+### 事件响应链
+
+- (1) 通过上面的步骤找到了，最终触发UIEvent触摸事件的 UIView 对象
+- (2) 再通过 给这个 UIView 设置的 各种 按钮事件、手势、触摸事件..找到对应的target
+ 
+ 
+### 下面是使用自定义 UIApplication 拦截全局的 UI触摸事件
+
+```objc
+@interface MyApplication : UIApplication
+@end
+@implementation MyApplication
+
+- (BOOL)sendAction:(SEL)action to:(id)target from:(id)sender forEvent:(UIEvent *)event {
+    NSLog(@"%s action = %@, target = %@ from = %@ event = %@",  __func__, NSStringFromSelector(action), target, sender, event);
+    return [super sendAction:action to:target from:sender forEvent:event];
+}
+
+- (void)sendEvent:(UIEvent *)event {
+    NSLog(@"sendEvent: event = %@", event);
+    [super sendEvent:event];
+}
+
+@end
+```
+
+main.m 中使用自定义的 Application 
+
+```objc
+int main(int argc, char * argv[]) {
+    @autoreleasepool {
+        return UIApplicationMain(argc, argv, @"MyApplication", NSStringFromClass([AppDelegate class]));
+    }
+}
+```
+
+这样之后，每当屏幕发生触摸点击事件，就会输出类似如下
+
+```
+2017-03-29 23:26:15.420 AnimationsDemo[2173:69454] sendEvent: event = <UITouchesEvent: 0x7fec8ac06f50> timestamp: 5121.41 touches: {(
+    <UITouch: 0x7fec8d02e110> phase: Ended tap count: 1 window: <UIWindow: 0x7fec8ae0c750; frame = (0 0; 320 568); gestureRecognizers = <NSArray: 0x7fec8ae165f0>; layer = <UIWindowLayer: 0x7fec8ae15180>> view: <UIView: 0x7fec8af0f620; frame = (0 0; 320 568); autoresize = W+H; layer = <CALayer: 0x7fec8af0ba30>> location in window: {114.5, 295.5} previous location in window: {114.5, 295.5} location in view: {114.5, 295.5} previous location in view: {114.5, 295.5}
+)}
+```
+
+每当屏幕发生触摸事件，就会调用 `sendAction:` 其传入的 UIEvent对象 就是触摸事件的抽象。
 
 ## sendAction 发送UIEvent事件
 
@@ -1956,28 +2273,42 @@ Class object_getClass(id obj)
 @end
 ```
 
-## Category不会`覆盖`原始方法实现，以及多个Category重写相同的方法实现的调用顺序
+## Category 并不会`覆盖`原始方法实现，以及多个Category重写相同的方法实现的调用顺序
 
-### 主要涉及的问题
+主要涉及的问题
 
 ```
 1. Category是否会覆盖原始Class中的Method？
 2. 多个Category添加相同的Method，调用顺序是什么？
 ```
 
-### 一、Category中重写原始类中已经存在的方法实现时
+有2个问题：
 
-- (1) Category中重写的Method，肯定会排在原始类的Method的`最前面`
+```
+1. Category是否会覆盖原始Class中的Method？
+2. 多个Category添加相同的Method，调用顺序是什么？
+```
 
-- (2) 每当从编译路径中读取到Category重写的Method，就会将这个重写的Method采用`头插法`插入到原始类的`method_list`的`第一个`位置
+答案是，都是在xcode编译路径出现的越后面的分类中重写的method会被调用，而之前的都不会调用。
 
-也就是说，越在后面编译的Category中重写的Method，却会出现在`method_list`的第一个位置
-	
-### 二、多个Category中，都重写了相同的方法实现时
+为什么？
 
-会按照Category在编译路径中的顺序，将Method依次`头插`到原始类的`method_list`单链表中。
+- (1) 所有的`objc_method`都是存放到一个链表`method_list`中
+- (2) 而对于分类中出现的`objc_method`，runtime环境会使用`头插法`将其插入到链表`method_list`中
 
-所以，也就是Category出现的越晚，重写的Method就会出现在第一个位置。
+所以，只是因为最晚出现的method，头插到了第一个位置。然后从第一个位置找到了method之后，就不会再继续往后找了，也就不会调用原始类和出现在之前的分类method了。
+
+在程序运行时，我们写的每一个objc类，在内存中的表现：
+
+```c
+- objc_class
+	- ivar_list
+	- property_list
+	- method_list
+	- protocol_list
+- meta objc_class
+	- method_list
+```
 
 具体测试，搜索`Category覆盖原始类中的方法实现存在的问题.md`。
 
@@ -2027,13 +2358,15 @@ GPU >>> 大量进行图像渲染，少进行数据计算
 
 ### 为什么不要重写`drawRect:` 
 
-- (1) 只要重写`drawRect:`，就会给layer创建一个`空的宿主图像`而浪费内存
+- (1) 只要重写 drawRect: ，就会给layer立马创建一个contents
 
-- (2) `CoreGraphics`的图像绘制，会触发`CPU的离屏渲染`，而CPU的`图像渲染`能力是很差的，会影响CPU的执行效率
+- (2) CoreGraphics 的图像绘制，会触发 CPU的离屏渲染 ，而CPU的 图像渲染 能力是很差的，最好不要在主线程上弄
 
-- (3) `专用图层`把图像渲染代码使用OpenGL操作`GPU`来完成图像的渲染，内存优化
+- (3)  专用图层 把图像渲染代码使用OpenGL操作 GPU 来完成图像的渲染，内存优化
+	- CAShapeLayer、CATextLayer、CATiledLayer ... 
 
-下面是使用专用图层来绘制自定义路径的代码模板，`代替`使用重写`drawRect:`
+
+### 下面是使用专用图层来绘制自定义路径的代码模板，`代替`使用重写`drawRect:`
 
 ```objc
 @implementation XingNengVC {
@@ -2073,7 +2406,15 @@ GPU >>> 大量进行图像渲染，少进行数据计算
 @end
 ```
 
-## objc对象的`释放`与`废弃`，是两个`不同的阶段`
+### 但是还是无法避免，很多时候还是需要自定义绘制，并且也还是有相应的优化方法
+
+- (1) 如果是绘制文本，使用CoreText在子线程预先渲染得到bitmap
+- (2) 如果是绘制图片，同样在子线程并使用ImageIO读取解压并解码，然后使用CoreGraphics渲染得到bitmap
+
+总之，尽量的在子线程完成。
+
+## objc对象的 `释放` 与 `废弃` ，是两个 `不同的阶段`
+
 ### 释放
 
 应该是释放对象的`持有`，即对objc对象发送`retain\release\autorelase`等消息，修改objc对象的`retainCount`值，但是对象的内存一直都还存在。
@@ -2085,7 +2426,6 @@ GPU >>> 大量进行图像渲染，少进行数据计算
 当某个`空闲`时间，系统才会将内存的数据全部擦除干净，然后将这块内存`合并为系统未使用的内存`中。而此时如果程序继续访问该内存块，就会造成程序崩溃。
 
 内存的彻底`废弃`操作，是`异步`的，也就是说有一定的`延迟`。
-
 
 ### 执行了`-[NSObject dealloc]`，并不是说对象所在内存就被`废弃`了。只是对于常理来说，这个对象已经`标记`为即将废弃，程序中也不要再继续使用了。
 
@@ -2126,9 +2466,109 @@ thread 1:EXC_BAD_ACCESS ....
 
 ## objc对象弱引用实现
 
-- (1) NSValue
-- (2) block + `__weak`
-- (3) NSProxy或NSObject的消息转发
+### NSValue
+
+
+```objc
+//1. NSValue弱引用方式包装一个objc对象
+NSValue *value = [NSValue valueWithNonretainedObject:@"objc对象"];
+
+//2. 从NSValue获取弱引用的objc对象
+id weakObj = [value nonretainedObjectValue];
+```
+
+### `block` + `__weak`
+
+- (1) 返回值类型是id，参数类型是void，的block类型定义
+
+```c
+typedef id (^WeakReferenceBlcok)(void);
+```
+
+- (2) 将外界传入的需要弱引用处理的对象，借助block，进行`__weak`处理
+
+```c
+WeakReferenceBlcok makeWeakReference(id obj) {
+    
+    //1. 对外界传入的对象进行弱引用
+    id __weak weakObj = obj;
+    
+    //2. 返回一个Block，执行Block后，让外界拿到 __weak 处理后的弱引用用对象
+    return ^() {
+        return weakObj;
+    };
+}
+```
+
+- (3) 对NSMutableDictionary稍加封装，添加如上的处理代码
+
+```objc
+@interface XZHDic : NSObject {
+    NSMutableDictionary *_dic;//TODO: 初始化代码那些就不写了.....
+}
+
+- (void)weak_setObject:(id)anObject forKey:(NSString *)aKey;
+- (id)weak_getObjectForKey:(NSString *)key;
+
+@end
+@implementation XZHDic
+
+- (void)weak_setObject:(id)anObject forKey:(NSString *)aKey {
+    //1.
+    WeakReferenceBlcok block = makeWeakReference(anObject);
+    
+    //2.
+    [_dic setObject:block forKey:aKey];
+}
+
+- (id)weak_getObjectForKey:(NSString *)key {
+    //1.
+    WeakReferenceBlcok block = [_dic objectForKey:key];
+    
+    //2.
+    return (block ? block() : nil);
+}
+
+@end
+```
+
+### 利用 NSProxy 或 NSObject 的消息转发转发阶段一 `forwardingTargetForSelector:`
+
+
+```objc
+#import <Foundation/Foundation.h>
+#import "Human.h"
+
+@interface XZHProxy : NSProxy <Human>
+
+/**
+ *  被代理的弱引用对象
+ */
+@property (nonatomic, weak, readonly) id<Human> target;
+
+/**
+ *  传入要被弱引用的对象
+ */
+- (instancetype)initWithTarget:(id<Human>)target;
+
+@end
+@implementation XZHProxy
+
+- (instancetype)initWithTarget:(id<Human>)target {
+    _target = target;
+    return self;
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    return _target;
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    return [_target respondsToSelector:aSelector];
+}
+
+@end
+```
 
 具体参考`几种弱引用实现方法.md`.
 
@@ -2515,7 +2955,6 @@ NSMethodSignature 方法签名，正是用来打包上面的所有的types。
 - (1) isEqual:
 - (2) hash
 
-
 ```objc
 @implementation Person
 
@@ -2564,6 +3003,263 @@ NSMethodSignature 方法签名，正是用来打包上面的所有的types。
 
 @end
 ```
+
+## NSArray 与 NSSet 在存储item对象时的区别
+
+### 先看区别
+
+- (1) NSArray 纯粹是依赖 `index` 来存取 item对象
+
+- (2) NSSet 是根据 `-[NSObject hash] 与 -[NSObject isEqual:]` 来存取
+
+- (3) **NSSet压根就没有获取某个位置的item对象的接口，只能是获取全部的items对象**
+
+### NSSet 是 散列表 无顺序的集合，就是一个哈希表的存储结构。我们无法指定 hash 表 存储对象的 位置，而是必须通过 hash表自己 计算一个元素的存储位置的基本思路如下：
+
+假设有一组待加入到set的序列集合
+
+```
+{12，13，25，23，38，34，6，84，91}
+```
+
+hash表内部，根据传入的item值，计算得到插入位置的算法:
+
+```
+address(key) = key % 11
+```
+
+那么最终插入到 hash map 的结构如下:
+
+<img src="./hashmap01.jpg" alt="" title="" width="700"/>
+
+可以看到，当对传入的item值，计算的到相同地址时，就需要挨个往后探测，找到一个空的位置，进行当前item值得插入。
+
+而如果对已经存在于hash表中的item值，进行修改，就会造成插入位置的错误。
+
+
+### 测试一、不重写 hash、`isEqual:` 情况下
+
+```objc
+@interface HashObject : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, assign) NSInteger uid;
+@end
+@implementation HashObject
+@end
+```
+
+```objc
+- (void)test1 {
+    NSMutableSet *set = [NSMutableSet new];
+    
+    // obj1
+    HashObject *obj1 = [HashObject new];
+    obj1.name = @"haha 1";
+    obj1.uid = 1111;
+    NSLog(@"obj1.hash = %ld", obj1.hash);
+    
+    // obj2
+    HashObject *obj2 = [HashObject new];
+    obj2.name = obj1.name;
+    obj2.uid = obj1.uid;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+    // add objets
+    [set addObject:obj1];
+    [set addObject:obj2];
+    
+    // log set
+    NSLog(@"set = %@", set);
+}
+```
+
+输出
+
+```
+2017-03-28 20:05:13.625 Demos[16469:470717] obj1.hash = 106102872327712
+2017-03-28 20:05:13.625 Demos[16469:470717] obj2.hash = 106102872328352
+2017-03-28 20:05:13.626 Demos[16469:470717] set = {(
+    <HashObject: 0x60800003c620>,
+    <HashObject: 0x60800003c8a0>
+)}
+```
+
+即使两个对象的属性值一样，但是hash值，还是不一样的，这就是系统的`hash+isEqual:`的实现。
+
+```objc
+- (void)test2 {
+    
+    // obj1
+    HashObject *obj1 = [HashObject new];
+    obj1.name = @"haha 1";
+    obj1.uid = 1111;
+    NSLog(@"obj1.hash = %ld", obj1.hash);
+    
+    // obj2
+    HashObject *obj2 = [HashObject new];
+    obj2.name = @"haha 2";
+    obj2.uid = 2222;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+    // modify obj2
+    obj2.name = obj1.name;
+    obj2.uid = obj1.uid;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+}
+```
+
+输出
+
+```
+2017-03-28 20:08:41.122 Demos[16552:473488] obj1.hash = 105553116519328
+2017-03-28 20:08:41.122 Demos[16552:473488] obj2.hash = 105553116519136
+2017-03-28 20:08:41.122 Demos[16552:473488] obj2.hash = 105553116519136
+```
+
+即使后面修改对象的属性值，该对象的hash值还是不会发生变化。
+
+### 测试二、重写 hash、`isEqual:` 情况下
+
+```objc
+@interface HashObject : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, assign) NSInteger uid;
+@end
+@implementation HashObject
+
+//////////////////////// 重写 hash、isEqual: ////////////////////////
+
+- (NSUInteger)hash {
+    return [_name hash] ^ _uid;
+}
+- (BOOL)isEqual:(id)object {
+    if ([object class] == [HashObject class]) {
+        return [self isEqualToObject:object];
+    }
+    return [super isEqual:object];
+}
+
+- (BOOL)isEqualToObject:(HashObject*)object {
+    
+    //1.
+    if (self == object) {return YES;}
+    
+    //2.
+    if (![_name isEqualToString:object.name]) {return NO;}
+    if (_uid != object.uid) {return NO;}
+    
+    //3.
+    return YES;
+}
+
+@end
+```
+
+再执行test2的输出
+
+```
+2017-03-28 20:10:44.644 Demos[16596:475247] obj1.hash = 9345447525204606
+2017-03-28 20:10:44.645 Demos[16596:475247] obj2.hash = 9345447525207748
+2017-03-28 20:10:44.645 Demos[16596:475247] obj2.hash = 9345447525204606
+```
+
+可以看到，我们自己重写了之后的情况，对象的hash值已经可以发生变化了。
+
+```objc
+- (void)test4 {
+    NSMutableSet *set = [NSMutableSet new];
+    
+    // obj1
+    HashObject *obj1 = [HashObject new];
+    obj1.name = @"haha 1";
+    obj1.uid = 1111;
+    NSLog(@"obj1.hash = %ld", obj1.hash);
+    
+    // obj2
+    HashObject *obj2 = [HashObject new];
+    obj2.name = obj1.name;
+    obj2.uid = obj1.uid;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+    // add objets
+    [set addObject:obj1];
+    [set addObject:obj2];
+    
+    // log set
+    NSLog(@"set = %@", set);
+}
+```
+
+输出
+
+```
+2017-03-28 20:13:17.798 Demos[16668:477445] obj1.hash = 9345447525204606
+2017-03-28 20:13:17.798 Demos[16668:477445] obj2.hash = 9345447525204606
+2017-03-28 20:13:17.799 Demos[16668:477445] set = {(
+    <HashObject: 0x60000022f560>
+)}
+```
+
+可以看到，重写之后，set对于相同的hash值，只能保存一个对象了。
+
+我想之前在没有重写hash、`isEqual:`时的对象，进行加入set时，系统的实现可能还加入了对象的`地址`以及其他的参数的hash运算，所以导致最终的hash值，其实并不一样。
+
+```objc
+- (void)test5 {
+    NSMutableSet *set = [NSMutableSet new];
+    
+    // obj1
+    HashObject *obj1 = [HashObject new];
+    obj1.name = @"haha 1";
+    obj1.uid = 1111;
+    NSLog(@"obj1.hash = %ld", obj1.hash);
+    
+    // obj2
+    HashObject *obj2 = [HashObject new];
+    obj2.name = @"haha 2";
+    obj2.uid = 2222;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+    // add objets
+    [set addObject:obj1];
+    [set addObject:obj2];
+    
+    // log set
+    NSLog(@"set = %@", set);
+    
+    // modify obj2
+    obj2.name = obj1.name;
+    obj2.uid = obj1.uid;
+    NSLog(@"obj2.hash = %ld", obj2.hash);
+    
+    // log set
+    NSLog(@"set = %@", set);
+    
+}
+```
+
+输出
+
+```
+2017-03-28 20:15:38.804 Demos[16703:478839] obj1.hash = 9345447525204606
+2017-03-28 20:15:38.805 Demos[16703:478839] obj2.hash = 9345447525207748
+2017-03-28 20:15:38.805 Demos[16703:478839] set = {(
+    <HashObject: 0x60800022a160>,
+    <HashObject: 0x608000226e00>
+)}
+2017-03-28 20:15:38.805 Demos[16703:478839] obj2.hash = 9345447525204606
+2017-03-28 20:15:38.805 Demos[16703:478839] set = {(
+    <HashObject: 0x60800022a160>,
+    <HashObject: 0x608000226e00>
+)}
+```
+
+当修改了obj2的属性值后，obj2对象的hash值，已经变为和obj1的hash值是一样的了。
+
+但是此时set中，却存在两个相同hash值得对象，这个违背了 哈希表 数据结构，理论上来说是有问题的。
+
+但是也可以看到，set并不会 **主动的去过滤掉** 某一个相同的对象。
 
 ## NSAarray与NSMuatbleArray在alloc、init时的类型是不同的
 
@@ -3499,29 +4195,154 @@ _displayLink = nil;
 ### 基于`dispatch_source_t`的timer source 事件
 
 ```c
-//1. source 回调执行所在的线程队列
-dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+@implementation ViewController {
+    dispatch_source_t _timer;
+}
 
-//2. 创建基于timer类型的source
-dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,queue);
+- (void)addTimerSource {
+    
+    //1. source 回调执行所在的线程队列
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    
+    //2. 创建基于timer类型的source
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,queue);
+    
+    //3. 设置回调间隔时间为1秒
+    dispatch_source_set_timer(_timer,dispatch_walltime(NULL, 0),1.0*NSEC_PER_SEC, 0);
+    
+    //4. 回调执行的代码
+    dispatch_source_set_event_handler(_timer, ^{
+        NSLog(@" task in thread %@", [NSThread currentThread]);
+    });
+    
+    //5. 开始处理source
+    dispatch_resume(_timer);
+    
+    //6. 移除并停止source
+    //dispatch_source_cancel(_timer);
+    //_timer = nil;
+}
 
-//3. 设置回调间隔时间为1秒
-dispatch_source_set_timer(_timer,dispatch_walltime(NULL, 0),1.0*NSEC_PER_SEC, 0); 
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
 
-//4. 回调执行的代码                
-dispatch_source_set_event_handler(_timer, ^{
-    // 回调执行的代码                
-});
+// (lldb) po [NSRunLoop currentRunLoop]
 
-//5. 开始处理source
-dispatch_resume(_timer);
+	[self addTimerSource];
 
-//6. 移除并停止source
-dispatch_source_cancel(_timer);
-_timer = nil;
+// (lldb) po [NSRunLoop currentRunLoop]
+	
+}
+
+@end
 ```
 
-由于`dispatch_source_t`类的事件基本是比较高的，不会受runloop的mode变化而受影响。
+执行`[self addTimerSource];`之前的打印runloop信息
+
+```
+.....
+
+common mode items = <CFBasicHash 0x7fcdca5090b0 [0x10ffc37b0]>{type = mutable set, count = 17,
+
+.....
+```
+
+执行`[self addTimerSource];`之后的打印runloop信息
+
+```
+......
+
+common mode items = <CFBasicHash 0x7fcdca5090b0 [0x10ffc37b0]>{type = mutable set, count = 17,
+
+......
+```
+
+执行前后，发现 主线程 runloop 的 common mode items 中 source的总个数 并没有发生变化，那真的不是通过runloop来处理的，所以 `dispatch_source_t` 可以不受runloop轮回的影响。
+
+## `dispatch_source_t` 监听系统底层的事件
+
+### Dispatch Source 一共可以监听 `六大类` 事件，总共分为11个类型
+
+```
+1. Timer Dispatch Source：定时调度源。
+2. Signal Dispatch Source：监听UNIX信号调度源，比如监听代表挂起指令的 SIGSTOP信号。
+3. Descriptor Dispatch Source：监听文件相关操作和Socket相关操作的调度源。
+4. Process Dispatch Source：监听进程相关状态的调度源。
+5. Mach port Dispatch Source：监听Mach相关事件的调度源。
+6. Custom Dispatch Source：监听自定义事件的调度源。
+```
+
+总共分为11个类型
+
+```c
+DISPATCH_SOURCE_TYPE_DATA_ADD：属于自定义事件，可以通过dispatch_source_get_data函数获取事件变量数据，在我们自定义的方法中可以调用dispatch_source_merge_data函数向Dispatch Source设置数据，下文中会有详细的演示。
+DISPATCH_SOURCE_TYPE_DATA_OR：属于自定义事件，用法同上面的类型一样。
+DISPATCH_SOURCE_TYPE_MACH_SEND：Mach端口发送事件。
+DISPATCH_SOURCE_TYPE_MACH_RECV：Mach端口接收事件。
+DISPATCH_SOURCE_TYPE_PROC：与进程相关的事件。
+DISPATCH_SOURCE_TYPE_READ：读文件事件。
+DISPATCH_SOURCE_TYPE_WRITE：写文件事件。
+DISPATCH_SOURCE_TYPE_VNODE：文件属性更改事件。
+DISPATCH_SOURCE_TYPE_SIGNAL：接收信号事件。
+DISPATCH_SOURCE_TYPE_TIMER：定时器事件。
+DISPATCH_SOURCE_TYPE_MEMORYPRESSURE：内存压力事件。
+```
+
+### 再来看下 创建 dispatch source 函数的 参数含义:
+
+```c
+dispatch_source_t dispatch_source_create(
+	dispatch_source_type_t type, // (1)
+	uintptr_t handle,	// (2)
+	unsigned long mask,	// (3)
+ 	dispatch_queue_t queue	// (4)
+);	
+```
+
+type：第一个参数用于标识Dispatch Source要监听的事件类型，共有11个类型。
+
+
+handle：第二个参数是取决于要监听的事件类型。比如：
+
+- (1) 如果是监听 `Mach端口` 相关的事件，那么该参数就是 `mach_port_t` 类型的 `Mach端口号`
+
+- (2) 其他一般情况下，设置为 `0` 就可以了
+
+mask：第三个参数同样取决于要监听的事件类型。比如如果是监听 `文件属性更改` 的事件，那么该参数就标识 `文件的哪个属性`，比如 `DISPATCH_VNODE_RENAME`。
+
+queue：第四个参数设置回调函数所在的队列。
+
+### `dispatch_source_get_handle(source)` 获取 创建的 disaptch source 的 type 值
+
+```c
+uintptr_t
+dispatch_source_get_handle(dispatch_source_t source);
+```
+
+返回值如下
+
+```
+ *  DISPATCH_SOURCE_TYPE_DATA_ADD:        n/a
+ *  DISPATCH_SOURCE_TYPE_DATA_OR:         n/a
+ *  DISPATCH_SOURCE_TYPE_MACH_SEND:       mach port (mach_port_t)
+ *  DISPATCH_SOURCE_TYPE_MACH_RECV:       mach port (mach_port_t)
+ *  DISPATCH_SOURCE_TYPE_MEMORYPRESSURE   n/a
+ *  DISPATCH_SOURCE_TYPE_PROC:            process identifier (pid_t)
+ *  DISPATCH_SOURCE_TYPE_READ:            file descriptor (int)
+ *  DISPATCH_SOURCE_TYPE_SIGNAL:          signal number (int)
+ *  DISPATCH_SOURCE_TYPE_TIMER:           n/a
+ *  DISPATCH_SOURCE_TYPE_VNODE:           file descriptor (int)
+ *  DISPATCH_SOURCE_TYPE_WRITE:           file descriptor (int)
+```
+
+### 还可以注册 dipatch source 被取消时的 回调
+
+```c
+void
+dispatch_source_set_cancel_handler(
+	dispatch_source_t source,
+	dispatch_block_t handler
+);
+```
 
 ## RunLoop、RunLoop的基本组成结构
 
@@ -3651,33 +4472,50 @@ __CFRunLoop
 	    CFMutableArrayRef _timers;
 ```
 
-## RunLoop、只要thread成功开启runloop（需要添加source）。那么有，一、局部thread对象`不会`被废弃。二、会卡住thread入口函数中`[runloop run];`后面的代码执行
+## RunLoop、NSThread 成功开启 RunLoop（需要添加 RunLoopSource）后的作用
+
+### 开起 RunLoop 之后，只要 RunLoopSource 一直存在，并且 RunLoop 不退出，则有:
+
+- (1) 即使是局部创建的 NSThread对象， 也`不会`被废弃
+- (2) 会卡住 NSThread入口函数中 `[runloop run];` 后面的代码执行
+- (3) 但不会卡住当前开起RunLoop的NSThread线程对象的执行（神奇）
+- (4) NSThread 对象的 状态 一直处于 `isExecuting == YES` 
+- (5) NSThread 对象 可以一直的接受 线程任务执行
+
+### 下面是创建一个局部的NSThread对象，并添加 RunLoopSource 然后开起 RunLoop 的测试
+
+自定义的NSThread，在dealloc的时候log信息
 
 ```objc
-#import <Foundation/Foundation.h>
-
 @interface MyThread : NSThread
-
 @end
 @implementation MyThread
+
 - (void)dealloc {
-    NSLog(@"MyThread dealloc >>>> %@", self);
+    NSLog(@"%@ dealloc", self);
 }
+
 @end
 ```
 
-```objc
-@implementation ViewController
+ViewController测试
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
+```objc
+@implementation ThreadViewController
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     
-    // 局部thread对象
-    MyThread *t = [[MyThread alloc] initWithTarget:self selector:@selector(doInitThread) object:nil];
-    [t start];
+    //1.
+    MyThread *thread = [[MyThread alloc] initWithTarget:self
+                                               selector:@selector(doInitThread)
+                                                 object:nil];
+    
+    //2.
+    [thread start];
 }
 
 - (void)doInitThread {
+    
     //1.
     NSThread *t = [NSThread currentThread];
     
@@ -3701,11 +4539,11 @@ __CFRunLoop
         //3.5
         [runloop run];
         
-        //3.6   
+        //3.6
         NSLog(@"doInitThread >>>> runlop开始执行");
     }
     
-    //4. 
+    //4.
     NSLog(@"MyThread doInitThread >>>> %@", [NSThread currentThread]);
 }
 
@@ -3715,24 +4553,63 @@ __CFRunLoop
 程序运行后的输出
 
 ```
-2016-11-27 17:08:26.499 RunLoopBasic[8294:108202] doInitThread >>>> 添加port事件之前
-2016-11-27 17:08:26.500 RunLoopBasic[8294:108202] doInitThread >>>> 添加port事件之后, runloop还未开启
+2017-03-29 13:48:21.283 Demos[7740:128487] doInitThread >>>> 添加port事件之前
+2017-03-29 13:48:21.283 Demos[7740:128487] doInitThread >>>> 添加port事件之后, runloop还未开启
 ```
 
-可以看到:
+发现并没有看到 MyThread对象的 dealloc输出信息，说明 MyThread对象并没有被废弃掉，还是处于内存中。
 
-(1) 局部创建的thread对象，并没有被废弃
-(2) 同样doInitThread实现内的流程会卡在3.5句代码`[runloop run];`地方，不会再往下执行
+并且，doInitThread实现内的流程会卡在 `3.5句` 代码`[runloop run];`地方，不会再往下执行。
 
-如果想要将自己创建的NSThread对象，永远保持存活状态（并不只是不废弃，而是随时能够接受线程任务执行），就需要给线程做几件事：
+那么将添加 runloopsource 和 开起 runloop 的代码注释掉，再看效果:
 
-- (1) 获取线程的runloop
-- (2) 创建RunLoopSource，并添加到runloop
-- (3) `[runloop run]`开起runloop
+```objc
+@implementation ThreadViewController
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    
+    //1.
+    MyThread *thread = [[MyThread alloc] initWithTarget:self
+                                               selector:@selector(doInitThread)
+                                                 object:nil];
+    
+    //2.
+    [thread start];
+}
+
+- (void)doInitThread {
+    
+    //1.
+    NSThread *t = [NSThread currentThread];
+    
+    //2.
+    [t setName:@"MyThread"];
+        
+    //3.
+    NSLog(@"MyThread doInitThread >>>> %@", [NSThread currentThread]);
+}
+
+@end
+```
+
+得到的输出
+
+```
+2017-03-29 13:52:31.177 Demos[7824:133122] MyThread doInitThread >>>> <MyThread: 0x600000277380>{number = 3, name = MyThread}
+2017-03-29 13:52:31.179 Demos[7824:133122] <MyThread: 0x600000277380>{number = 3, name = MyThread} dealloc
+```
+
+这次可以看到 NSThread对象的 dealloc输出信息了，说明此时是废弃了。
+
+### 总结：如果想要将自己创建的NSThread对象，永远保持存活状态（并不只是不废弃，而是随时能够接受线程任务执行），就需要给线程做几件事：
+
+- (1) 创建线程的 Runloop （调用 get runloop 的方法即可）
+- (2) 创建 RunLoopSource，并且注册到 Runloop 的某一个 mode 下
+- (3) 执行 `[runloop run] 或 CFRunLoopRun()` 开起 当前NSThread对象的 Runloop
 
 这样之后，线程的state才会一直是`isExecuting`，否则就是`isFinished`。
 
-## RunLoop、在自定义线程上使用释放池
+## RunLoop、给自行创建的NSThread对象主动创建 AutoreleasePool 
 
 ```objc
 + (NSThread *)networkRequestThread {
@@ -3763,7 +4640,19 @@ __CFRunLoop
 }
 ```
 
-对于自己创建的`NSThread`子线程，一定要手动创建释放池。
+对于自己创建的`NSThread`子线程，一定要手动创建释放池。步骤如下:
+
+```
+1. 创建NSThread
+2. 在NSThread 线程入口函数中完成如下事情
+3. 创建runloop [NSRunLoop currentRunLoop]
+4. 添加 runloop observer
+5. 监听几个状态（ (1)runloop即将进入、(2)runloop即将休息、(3)runloop即将退出）
+6. 在 (1) 时，直接创建 NSAutoreleasePool
+7. 在 (2) 时，先释放废弃之前的 NSAutoreleasePool，再创建新的 NSAutoreleasePool
+8. 在 (3) 时，直接释放废弃 NSAutoreleasePool
+```
+
 
 ## RunLoop、给子线程的runloop添加2个Observer，用来给子线程永远保持一个最新鲜的释放池
 
@@ -3970,26 +4859,139 @@ static inline void XZHAutoreleasePoolPop() {
 }
 ```
 
-## RunLoop、界面重绘的过程 
+## RunLoop、界面重绘（重新绘制）的过程 
 
-- (1) 注册关注MainRunLoop的如下状态改变，是MainRunLoop最清闲的时候
+### 大致的过程
+
+- (1) 关注 Main RunLoop 的如下状态改变，是MainRunLoop最清闲的时候
 	- `kCFRunLoopBeforeWaiting` 即将休息
 	- `kCFRunLoopExit` 即将退出
 
-- (2) 即将重绘的UIView对象、哪一个属性值（font、textColor、backgroudColor...） 被CoreAnimation打包为一个`CATransaction`对象
-	- (2.1) 指定哪一个UIView对象的CALayer
-	- (2.2) 要触发哪一个属性值（font、textColor、backgroudColor...）的重绘
-	- (2.3) `[CATransaction commit]` 提交
+- (2) 当 UIView/CALayer 做出修改后，就会被标记为`待处理`，打包为一个`CATransaction`事务
+	- (2.1) UIView/CALayer 的层级发生变化
+	- (2.2) 修改 UIView/CALayer 对象的属性值后
+	- (2.3) 发送了 UIView/CALayer 的 `setNeedsLayout/setNeedsDisplay`消息
 
-- (3) CATransaction提交后，只是暂时保存到一个临时缓存区，类似于NSSet集合
+- (3) 参考YYTransaction的结构，理解`CATransaction`的结构为:
+	- (3.1) 是哪一个CALayer被比较为`待处理`，需要重新绘制
+	- (3.2) 是根据CALayer的哪一个`属性`的最新值，进行重新的绘制
 
-- (4) 等待MainRunLoop处于`kCFRunLoopBeforeWaiting 或 kCFRunLoopExit`状态回调时，再将上面的存放在临时缓存区中的`CATransaction对象的消息发送事件`，**注册**到MainRunLoop
-	- 只是注册到MainRunLoop，而MainRunLoop并不会立刻去处理消息发送
-	- 注册完毕，MainRunLoop休息了
+- (4) CATransaction **提交** 后，是先提交到一个全局缓存区，类似于NSSet集合
+	- (4.1) 先提交到缓冲区，因为很可能后续还会频繁的发生对同样属性修改后，避免每一次都去进行绘制
+	- (4.2) 如果后续再发生同样属性的绘制，先删除之前的transaction，而保存最新的transaction
+
+- (5) 某个时刻， Main RunLoop 处于`kCFRunLoopBeforeWaiting 或 kCFRunLoopExit`状态了
+	- (5.1) render server 所有的操作，都是处于一个 **单独的系统进程** 上
+	- (5.2) 从全局缓存区，取出所有的transaction绘制事务
+	- (5.3) 将所有的transaction绘制事务，发送给 render server
+	- (5.4) render server 挨个对每一个transaction进行绘制
+	- (5.5) render server 取出trnsaction中指向的是哪一个CALayer
+	- (5.6) render server 继而取出 CALayer 的 contents
+	- (5.7) render server 然后取出 CALayer 是哪一个 属性值 修改的重绘
+	- (5.8) 最后根据 `contents + 属性值数据 + 以及内部私有的状态数据` 进行绘制渲染，并通知显示器显示
+
 	
-- (5) 等待MainRunLoop被唤醒，开始新的一轮回时，就会处理上一轮回注册的`CATransaction对象的消息发送事件`
+真正对 CALayer数据 进行绘制和渲染，发生在单独的渲染服务进程上，完成之后直接存储到帧数据缓冲池，并通知显示器读取显示。
 
-利用了RunLoop处于最清闲的时刻，将多个重绘操作，按照RunLoop的每一个轮回，切割为多个批次进行重绘。
+### 整个过程中，对于RunLoop的source变化
+
+#### (1) 在执行关注RunLoop状态改变之前
+
+```
+(lldb) po [NSRunLoop mainRunLoop]
+<CFRunLoop 0x7febf3e04340 [0x107fed7b0]>{wakeup port = 0x1403, stopped = false, ignoreWakeUps = false, 
+current mode = UIInitializationRunLoopMode,
+common modes = <CFBasicHash 0x7febf3c05540 [0x107fed7b0]>{type = mutable set, count = 2,
+entries =>
+	0 : <CFString 0x109a80270 [0x107fed7b0]>{contents = "UITrackingRunLoopMode"}
+	2 : <CFString 0x10800db60 [0x107fed7b0]>{contents = "kCFRunLoopDefaultMode"}
+}
+,
+common mode items = <CFBasicHash 0x7febf3c04b30 [0x107fed7b0]>{type = mutable set, count = 16,
+..............
+```
+
+只有16个source。
+
+#### (2) 在执行关注RunLoop状态改变之后
+
+```
+(lldb) po [NSRunLoop mainRunLoop]
+<CFRunLoop 0x7febf3e04340 [0x107fed7b0]>{wakeup port = 0x1403, stopped = false, ignoreWakeUps = false, 
+current mode = UIInitializationRunLoopMode,
+common modes = <CFBasicHash 0x7febf3c05540 [0x107fed7b0]>{type = mutable set, count = 2,
+entries =>
+	0 : <CFString 0x109a80270 [0x107fed7b0]>{contents = "UITrackingRunLoopMode"}
+	2 : <CFString 0x10800db60 [0x107fed7b0]>{contents = "kCFRunLoopDefaultMode"}
+}
+,
+common mode items = <CFBasicHash 0x7febf3c04b30 [0x107fed7b0]>{type = mutable set, count = 17,
+......
+```
+
+有17个source了，比之前多了一个，就是添加的RunLoopObserver。
+
+```
+<CFRunLoopObserver 0x7febf3c71010 [0x107fed7b0]>{
+valid = Yes, 
+activities = 0xa0, 
+repeats = Yes, 
+order = 16777215,
+callout = XZHMainRunLoopObserverCallback (0x10731c520), 
+context = <CFRunLoopObserver context 0x0>}
+```
+
+并且这个observer分别存在于如下RunLoop Mode
+
+```
+1. UITrackingRunLoopMode
+2. kCFRunLoopDefaultMode
+```
+
+#### (3) 当执行RunLoop状态改变，挨个发送YYTrnsaction对象消息后
+
+```
+(lldb) po [NSRunLoop mainRunLoop]
+<CFRunLoop 0x7febf3e04340 [0x107fed7b0]>{wakeup port = 0x1403, stopped = false, ignoreWakeUps = false, 
+current mode = kCFRunLoopDefaultMode,
+common modes = <CFBasicHash 0x7febf3c05540 [0x107fed7b0]>{type = mutable set, count = 2,
+entries =>
+	0 : <CFString 0x109a80270 [0x107fed7b0]>{contents = "UITrackingRunLoopMode"}
+	2 : <CFString 0x10800db60 [0x107fed7b0]>{contents = "kCFRunLoopDefaultMode"}
+}
+,
+common mode items = <CFBasicHash 0x7febf3c04b30 [0x107fed7b0]>{type = mutable set, count = 18,
+```
+
+source变成18了，又比之前多了一个 `CFRunLoopSource`。
+
+```
+<CFRunLoopSource 0x7febf3c73af0 [0x107fed7b0]>{
+signalled = No, 
+valid = Yes, 
+order = 0, 
+context = <CFRunLoopSource MIG Server> 
+{port = 15111, subsystem = 0x10dc95f70, context = 0x7febf3d03ba0}}
+```
+
+也分别存在于如下 RunLoop mode
+
+```
+1. UITrackingRunLoopMode
+2. kCFRunLoopDefaultMode
+```
+
+并且这个`CFRunLoopSource`是 **sources1** 的类型，因为包含在`sources1`的数组中，如下:
+
+```
+sources1 = [
+	......
+]
+```
+
+`sources1` 类型的 `CFRunLoopSource` 包含了一个 `mach_port` 和 一个回调（函数指针），被用于通过内核和其他线程相互发送消息，这种 Source 能主动唤醒 RunLoop 的线程。
+
+因为最终的CALayer的绘制、渲染是在单独的渲染服务进程中执行，所有当渲染服务进程完成了一个绘制渲染任务之后，就通知我们的App程序进程中的主线程，已经完成了。
 
 ## delegate是1对1的，只能覆盖式设置，可以预先将别人的delegate保存起来
 
@@ -4249,4 +5251,100 @@ CADisplayLink没当屏幕进行绘制时，都会回调的函数实现
 _displayLink.paused = YES;
 [_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 [_displayLink invalidate];
+```
+
+## 查找当前屏幕上显示的ViewController
+
+```objc
+@implementation UIViewController (nevermore)
+
++ (UIViewController *)nvm_visiableViewController {
+  UIViewController *rootViewController = [[[[UIApplication sharedApplication] delegate] window] rootViewController];
+  return [UIViewController nvm_topViewControllerForViewController:rootViewController];
+}
+
++ (UIViewController *)nvm_topViewControllerForViewController:(UIViewController *)viewController {
+  if ([viewController isKindOfClass:[UITabBarController class]]) {
+  	// 递归调用
+    return [self nvm_topViewControllerForViewController:[(UITabBarController *)viewController selectedViewController]];
+  } else if ([viewController isKindOfClass:[UINavigationController class]]) {
+    return [(UINavigationController *)viewController visibleViewController];
+  } else {
+    if (viewController.presentedViewController) {
+    
+    	// 递归调用
+      return [self nvm_topViewControllerForViewController:viewController.presentedViewController];
+    } else {
+      return viewController;
+    }
+  }
+}
+
+@end
+```
+
+## 利用一个单例 cell对象 进行 frame 计算
+
+```objc
+@interface NVMRetailProductCellFrame : NSObject
+@property (nonatomic, assign) CGRect flagImageViewFrame;
+@property (nonatomic, assign) CGRect productImageViewFrame;
+@property (nonatomic, assign) CGRect productNameLabelFrame;
+....
+@end
+@implementation NVMRetailProductCellFrame
+@end
+```
+
+```objc
+@interface NVMRetailProductCell : UITableViewCell
+
+- (NVMRetailProductCellFrame *)computeCellHeightWithGood:(NVMRetailGoodModel*)model {
+
+	//1. 
+	NVMRetailProductCellFrame *frameModel = [NVMRetailProductCellFrame new];
+	
+	//2. subviews frame 计算
+	.........frame 计算...........
+	
+	//3.
+	frameModel.height = ......
+	
+	//4.
+	return frameModel;
+}
+
+@end
+```
+
+```objc
+@implementation NVMRetailProductListView
+
+- (void)computeCellFramesWithModelList:(NSArray*)goods flag:(BOOL)flag {
+
+	//1. 
+    static NVMRetailProductCell *cell = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cell = [[NVMRetailProductCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"frames"];
+    });
+    
+    //2. 计算传入的good list frame
+    NSMutableArray *frames = [NSMutableArray new];
+    for (int i = 0; i < goods.count; i++) {
+        NVMRetailGoodModel *good = [goods objectAtIndex:i];
+        NVMRetailProductCellFrame *frame = [cell computeCellHeightWithGood:good];
+        [frames addObject:frame];
+    }
+    
+    //3.
+    if (flag == YES) {
+        _frameList = [NSMutableArray new];
+    }
+    
+    //4. 
+    [_frameList addObjectsFromArray:frames];
+}
+
+@end
 ```
